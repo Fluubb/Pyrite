@@ -9,12 +9,15 @@ use pyrite_protocol::{ProtocolError, State};
 #[derive(Debug, thiserror::Error)]
 pub enum NetError {
     /// The peer sent something the codec could not decode.
-    #[error("protocol error")]
+    ///
+    /// Transport failures also arrive here, wrapped as
+    /// [`ProtocolError::Io`], because the codec's error type is
+    /// [`ProtocolError`] and it converts from [`std::io::Error`]. There is
+    /// deliberately no separate `NetError::Io` variant: one would be
+    /// unreachable, and having two spellings of the same condition is how a
+    /// severity check ends up missing half its cases.
+    #[error("protocol error: {0}")]
     Protocol(#[from] ProtocolError),
-
-    /// The underlying transport failed.
-    #[error("i/o error")]
-    Io(#[from] std::io::Error),
 
     /// The peer tried to move between states in a way the protocol forbids.
     #[error("illegal state transition from {from} to {to}")]
@@ -35,11 +38,31 @@ pub enum NetError {
         id: i32,
     },
 
+    /// A second status request arrived on a connection that already answered
+    /// one.
+    ///
+    /// Distinct from [`NetError::UnexpectedPacket`] because the packet ID is
+    /// perfectly valid in this state — it simply may not arrive twice, and a
+    /// log line saying "unexpected packet id 0x00 in state status" would
+    /// misdescribe that.
+    #[error("duplicate status request")]
+    DuplicateStatusRequest,
+
     /// The peer sent nothing for longer than the configured read timeout.
     #[error("connection timed out waiting for a packet")]
     Timeout,
+}
 
-    /// The peer closed the connection cleanly.
-    #[error("connection closed by peer")]
-    Closed,
+impl NetError {
+    /// Whether this error is ordinary transport noise rather than a protocol
+    /// violation.
+    ///
+    /// An idle timeout, a reset, and a truncated frame from a peer that hung
+    /// up mid-write are all routine on a public port: any host that connects
+    /// and walks away produces one. Logging them at `warn` would let a single
+    /// SYN buy a warning line, so they are logged at `debug` instead and only
+    /// genuine protocol violations reach `warn`.
+    pub fn is_transport_noise(&self) -> bool {
+        matches!(self, Self::Timeout | Self::Protocol(ProtocolError::Io(_)))
+    }
 }

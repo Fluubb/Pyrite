@@ -64,10 +64,7 @@ impl ConnectionState {
     /// Records that a status request was received, rejecting duplicates.
     pub fn mark_status_request_seen(&mut self) -> Result<(), NetError> {
         if self.status_request_seen {
-            return Err(NetError::UnexpectedPacket {
-                state: self.current,
-                id: 0x00,
-            });
+            return Err(NetError::DuplicateStatusRequest);
         }
         self.status_request_seen = true;
         Ok(())
@@ -148,7 +145,7 @@ mod tests {
         assert!(fsm.status_request_seen());
         assert!(matches!(
             fsm.mark_status_request_seen(),
-            Err(NetError::UnexpectedPacket { .. })
+            Err(NetError::DuplicateStatusRequest)
         ));
     }
 }

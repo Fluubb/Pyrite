@@ -96,28 +96,17 @@ pub enum ProtocolError {
     #[error("string field was not valid utf-8")]
     InvalidUtf8(#[from] std::str::Utf8Error),
 
-    /// No packet is defined for this state, direction, and ID combination.
-    #[error("unknown {direction} packet id {id:#04x} in state {state}")]
-    UnknownPacket {
-        /// The connection state the packet arrived in.
-        state: State,
-        /// The direction the packet travelled.
-        direction: Direction,
-        /// The packet ID that was not recognised.
-        id: i32,
-    },
-
     /// The handshake's next-state field was not 1, 2, or 3.
     #[error("invalid next state value {0}, expected 1 (status), 2 (login), or 3 (transfer)")]
     InvalidNextState(i32),
 
     /// A JSON payload failed to serialise or deserialise.
-    #[error("json payload error")]
+    #[error("json payload error: {0}")]
     Json(#[from] serde_json::Error),
 
     /// An underlying I/O error. Required because `tokio_util::codec::Decoder`
     /// mandates `From<std::io::Error>` on its error type.
-    #[error("i/o error")]
+    #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 
     /// A packet body contained more bytes than the packet's fields consume.
