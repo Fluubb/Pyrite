@@ -21,7 +21,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "time", "test-util"] }
 
 [lints]
 workspace = true

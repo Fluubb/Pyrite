@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
-use pyrite_net::{Connection, ServerConfig};
+use pyrite_net::{Connection, NetError, ServerConfig};
 use pyrite_protocol::codec::PacketCodec;
 use pyrite_protocol::packets::handshake::{Handshake, NextState};
 use pyrite_protocol::packets::login::LoginDisconnect;
@@ -122,7 +122,15 @@ async fn an_unknown_packet_id_closes_the_connection() {
     client.get_mut().write_all(&raw).await.unwrap();
 
     assert!(client.next().await.is_none());
-    assert!(task.await.unwrap().is_err());
+
+    // Assert the specific rejection, not merely that something went wrong: a
+    // bare `is_err()` would also pass if the connection died of a timeout or a
+    // decode failure, which would not be the behaviour under test.
+    let result = task.await.unwrap();
+    assert!(
+        matches!(result, Err(NetError::UnexpectedPacket { id: 0x7f, .. })),
+        "the dispatcher must reject the unknown id, got {result:?}"
+    );
 }
 
 #[tokio::test]
