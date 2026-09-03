@@ -9,6 +9,7 @@
 //! source, or private mapping was consulted.
 
 pub mod buf;
+pub mod codec;
 pub mod error;
 pub mod packets;
 pub mod text;

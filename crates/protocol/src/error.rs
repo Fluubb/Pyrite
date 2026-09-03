@@ -119,4 +119,11 @@ pub enum ProtocolError {
     /// mandates `From<std::io::Error>` on its error type.
     #[error("i/o error")]
     Io(#[from] std::io::Error),
+
+    /// A packet body contained more bytes than the packet's fields consume.
+    #[error("packet body had {remaining} trailing bytes")]
+    TrailingBytes {
+        /// How many bytes were left over.
+        remaining: usize,
+    },
 }
