@@ -1,0 +1,27 @@
+[package]
+name = "pyrite-net"
+description = "Connection lifecycle and state machine for the Pyrite server engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pyrite_net"
+
+[dependencies]
+pyrite-protocol.workspace = true
+bytes.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "io-util", "time"] }
+
+[lints]
+workspace = true
