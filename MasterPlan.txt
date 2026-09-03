@@ -1,0 +1,298 @@
+Master Project Plan: High-Performance Clean-Room Rust Game Server & WASM Mod Engine
+
+1. Executive Summary & Core Objectives
+
+1.1 Project Mission
+
+To design and build an independent, clean-room, memory-safe,
+ultra-high-performance server engine compatible with the standard Minecraft
+network protocol. The engine incorporates a secure, sandboxed WebAssembly (WASM)
+modloader, enabling multi-language mod authoring with zero dependence on
+proprietary decompiled code or legacy Java toolchains.
+
+1.2 Core Targets
+
+  - Performance: Sub-millisecond tick execution times under baseline loads;
+    support for 500+ concurrent players and tens of thousands of active dynamic
+    entities per node.
+  - Safety & Isolation: Sandboxed mod execution. A crashing, misbehaving, or
+    malicious mod must never crash the host server or gain unauthorized
+    filesystem/network access.
+  - Legal Compliance: 100% clean-room design. Zero usage or distribution of
+    proprietary Mojang bytecode, decompiled source trees, or proprietary assets.
+  - Extensibility: Mod development enabled across multiple languages (Rust, C++,
+    Zig, TypeScript/AssemblyScript) via a unified WASM-compiled binary
+    interface.
+
+2. High-Level Architectural Topology
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            HOST APPLICATION (RUST)                          │
+│                                                                             │
+│  ┌───────────────────────┐   ┌────────────────────┐   ┌──────────────────┐  │
+│  │   Network & Session   │   │  World & Chunk     │   │  Spatial Entity  │  │
+│  │   Engine (Tokio/Net)  │   │  Storage & Ticking │   │  System (ECS)    │  │
+│  └───────────┬───────────┘   └─────────┬──────────┘   └────────┬─────────┘  │
+│              │                         │                       │            │
+│  ┌───────────┴─────────────────────────┴───────────────────────┴──────────┐  │
+│  │                    CORE EVENT BUS & REGISTRY MANAGER                   │  │
+│  └─────────────────────────────────────┬──────────────────────────────────┘  │
+│                                        │                                     │
+│  ┌─────────────────────────────────────▼──────────────────────────────────┐  │
+│  │                 WASM MODLOADER RUNTIME (Wasmtime Engine)               │  │
+│  │                                                                        │  │
+│  │  • Resource Metering (Fuel)    • Epoch Interruption Timer              │  │
+│  │  • Capability Security         • Shared Memory Host Bridge             │  │
+│  └──────┬──────────────────────────────┬───────────────────────────┬──────┘  │
+└─────────┼──────────────────────────────┼───────────────────────────┼─────────┘
+          │ (WASM Boundary)              │ (WASM Boundary)           │
+   ┌──────▼──────┐                ┌──────▼──────┐             ┌──────▼──────┐
+   │ Mod: Magic  │                │ Mod: Tech   │             │ Mod: World  │
+   │ (Rust guest)│                │ (Zig guest) │             │ (TS guest)  │
+   └─────────────┘                └─────────────┘             └─────────────┘
+
+3. Subsystem Technical Specifications
+
+3.1 Network & Protocol Subsystem
+
+  - Transport Layer: Asynchronous non-blocking I/O powered by a multi-threaded
+    async runtime.
+  - Protocol Pipeline:
+      - Clean-room packet serialization and deserialization targeting current
+        protocol standards.
+      - Inbound pipeline: Decryption (AES-CFB8) \rightarrow Decompression (Zlib
+        threshold) \rightarrow VarInt packet framing \rightarrow Typed Packet
+        Dispatch.
+      - Outbound pipeline: State batching \rightarrow Compression \rightarrow
+        Encryption \rightarrow TCP socket flush.
+  - Connection Lifecycle Management: Explicit finite-state machines handling
+    transitions across Handshake, Status, Login, Configuration, and Play.
+
+3.2 World, Spatial & State Subsystem
+
+  - World Storage: High-performance chunk-section storage with bit-packed
+    palettes and SIMD-accelerated coordinate hashing.
+  - Entity Architecture: Data-oriented Entity Component System (ECS) ensuring
+    contiguous memory layout and cache-friendly parallel iteration across worker
+    threads.
+  - Spatial Partitioning: Dynamic bounding-volume hierarchies (BVH) or spatial
+    hash grids for zero-allocation player-entity tracking and raycast collision
+    detection.
+  - Tick Pipeline: Fixed 50ms (20 TPS) tick cycle divided into distinct parallel
+    stages:
+    1.  Inbound Network Packet Ingestion
+    2.  Input & Intent Processing
+    3.  Mod Engine Pre-Tick Hook Execution
+    4.  Physics, Movement & Collision Resolutions
+    5.  Entity & Block Logic Systems
+    6.  Mod Engine Post-Tick Hook Execution
+    7.  State Delta Calculation & Network Broadcast
+
+3.3 The WASM Mod Execution Environment (Host Layer)
+
+  - Runtime Core: Low-overhead JIT-compiled WebAssembly engine.
+  - Isolation & Sandboxing Architecture:
+      - Memory Isolation: Each mod executes within its own private virtual
+        memory space (32-bit linear address bounds).
+      - Instruction Metering (Fuel Consumption): Each tick pass assigns a finite
+        computational fuel quota to mods. Loops exceeding execution limits are
+        automatically terminated without blocking the main engine.
+      - Epoch-Based Interruption: Background watchdog timer monitoring
+        long-running guest calls to prevent deadlocks.
+  - Host-Guest Interoperability Bridge:
+      - Ultra-low-overhead shared memory buffers for passing bulk data (chunk
+        blocks, entity transforms, packet payloads) without heap-allocation
+        overhead.
+      - Host Function Interface: Strictly typed foreign function definitions
+        exposed to guest mods for world manipulation, entity spawning, and event
+        subscription.
+
+3.4 Asset & Resource Pipeline
+
+  - Dynamic Server-Driven Asset Synthesis:
+      - Automatically combines core game assets with custom textures, 3D models,
+        and sound files supplied by installed mods.
+      - Dynamically compiles and hashes an in-memory client resource pack upon
+        server startup.
+      - Issues cryptographically verified resource pack download links directly
+        to joining clients during the Configuration protocol stage.
+  - Server-Side Visual Proxies:
+      - Maps custom mod items to base items utilizing modern item_model and
+        custom_model_data components.
+      - Renders complex custom machines, structures, and interactive objects
+        using client-native display and interaction entities.
+
+4. Modloader SDK & Interface Design
+
+4.1 Mod Package Format (.modpack / .mcm)
+
+Each mod is packaged as a self-contained archive containing:
+
+1.  Manifest File: Declarative metadata (Mod ID, Version, Authors, Dependencies,
+    Required Engine Version, Permission Grants).
+2.  Binary Payload: One or more compiled .wasm modules targeting the
+    standardized API.
+3.  Assets Directory: Textures, model definitions, sound files, and language
+    localization strings.
+
+4.2 Guest SDK Architecture
+
+  - Provide strongly typed bindings for multiple languages:
+      - Tier 1 (First-Class): Rust Guest SDK.
+      - Tier 2: C / C++ / Zig Header Sets.
+      - Tier 3: TypeScript / AssemblyScript SDK.
+  - Exposed Engine Interfaces:
+      - Registration API: Registering custom items, custom blocks, sounds,
+        particle effects, and network channels.
+      - Event Bus: Hooks for block placements, player interactions, inventory
+        changes, chat messages, and entity damage.
+      - Query Engine: Spatial queries (e.g., locate all entities within a
+        spherical radius, raycast along player look-vectors).
+      - Persistent Storage API: Sandboxed Key-Value and Document storage per
+        mod, backed by the server's storage engine.
+
+5. Phased Development Roadmap
+
+Phase 0: Workspace Setup & Clean-Room Auditing
+   │
+Phase 1: Core Networking & Protocol Handshake
+   │
+Phase 2: World Engine, Palettes & Chunk Streaming
+   │
+Phase 3: Entity System & Player Interaction
+   │
+Phase 4: WASM Host Runtime & Memory Bridging
+   │
+Phase 5: Mod SDK, Event Bus & Host API Bindings
+   │
+Phase 6: Asset Compiler & Dynamic Resource Delivery
+   │
+Phase 7: Developer Tooling, CLI & Stress Testing
+
+Phase 0: Workspace Architecture & Standards
+
+  - Establish a modular multi-package workspace repository.
+  - Configure continuous integration pipelines for linting, formatting,
+    documentation validation, and multi-platform compilation checks.
+  - Establish strict clean-room governance rules: zero inclusion of proprietary
+    dependencies or decompiled source artifacts.
+
+Phase 1: Protocol Foundations & Session Pipeline
+
+  - Implement low-level networking: asynchronous socket acceptors, framing,
+    VarInt codecs, AES encryption, and Zlib compression.
+  - Complete the handshake, status (server list ping), authentication, and
+    configuration stages.
+  - Ensure a standard unmodified client can connect, authenticate, and enter an
+    empty void world.
+
+Phase 2: World Pipeline & Chunk Management
+
+  - Implement high-speed Anvil/Region file readers and in-memory chunk storage.
+  - Build chunk section palette builders and bit-packing pipelines.
+  - Implement view-distance management and multi-threaded chunk streaming around
+    moving players.
+
+Phase 3: ECS, Physics & Basic Interaction
+
+  - Implement an Entity Component System for tracking player state, position,
+    velocity, and animations.
+  - Build spatial tracking pipelines to broadcast player movements and spawn
+    packets efficiently.
+  - Implement fundamental block breaking, block placing, and basic movement
+    collision validation.
+
+Phase 4: WASM Host Runtime Integration
+
+  - Integrate the core WebAssembly execution engine into the host server.
+  - Design and implement the low-level Foreign Function Interface (FFI) and
+    shared-memory communication buffers.
+  - Implement safety constraints: memory boundary validation, fuel accounting,
+    and epoch interruption mechanics.
+
+Phase 5: Mod API & Event Dispatch Systems
+
+  - Build the mod loading lifecycle: manifest parsing, dependency resolution
+    ordering, module compilation, and instance initialization.
+  - Implement the core Event Bus: translating internal server state changes into
+    guest-invoked callbacks.
+  - Implement the host function registry allowing mods to spawn entities,
+    manipulate blocks, and mutate inventories.
+
+Phase 6: Dynamic Resource Pack Pipeline
+
+  - Develop the asset pipeline to discover, validate, and merge asset
+    directories from all loaded mods.
+  - Build an automated resource pack builder that creates optimal zip archives,
+    calculates SHA-1 checksums, and hosts assets via an integrated HTTP service.
+  - Implement visual component mapping linking custom mod item IDs to
+    client-side resource displays.
+
+Phase 7: SDKs, CLI Tooling & Validation
+
+  - Author and release the Guest SDK libraries for mod developers.
+  - Build a dedicated developer CLI utility for initializing, testing, and
+    packaging mods.
+  - Execute heavy automated stress testing: synthetic client bots, memory leak
+    profiling, tick time latency verification, and fuzz testing of the WASM
+    boundary.
+
+6. Conceptual Workspace Layout
+
+project-root/
+│
+├── crates/
+│   ├── engine-core/        # Central game loop, tick orchestration, and server lifecycle
+│   ├── engine-net/         # Low-level networking, encryption, compression, and socket pipelines
+│   ├── engine-protocol/    # Clean-room packet definitions, codecs, and state transitions
+│   ├── engine-world/       # Chunk storage, palettes, regions, and spatial partitioning
+│   ├── engine-ecs/         # Entity component system and query infrastructure
+│   ├── engine-modloader/   # WASM runtime host, sandboxing, instance management, and FFI
+│   ├── engine-assets/      # Dynamic resource pack compiler, asset aggregator, and HTTP host
+│   └── engine-cli/         # Server control binary and management interface
+│
+├── sdk/
+│   ├── guest-rust/         # First-party Rust SDK for mod developers
+│   ├── guest-c/            # C / C++ / Zig headers and bindings
+│   └── guest-ts/           # TypeScript / AssemblyScript bindings
+│
+├── tools/
+│   └── mod-builder/        # CLI tool for scaffolding, compiling, and packaging mods
+│
+├── tests/
+│   ├── protocol-tests/     # Automated packet fuzzing and validation suites
+│   ├── mod-sandboxing/     # Security tests validating WASM fuel and memory isolation
+│   └── bot-stress/         # Headless bot infrastructure for high-scale concurrency testing
+│
+└── docs/                   # Architecture decision records and API documentation
+
+7. Quality Assurance, Benchmarking & Safety Strategy
+
+7.1 Security & Sandboxing Verification
+
+  - Memory Bounds Fuzzing: Execute mods that intentionally attempt out-of-bounds
+    pointer operations to ensure the host engine never faults.
+  - Deadlock Simulation: Inject guest modules with infinite loops and deep
+    recursion to verify that instruction fuel limits and epoch timers forcefully
+    yield control.
+  - Filesystem & Network Isolation: Ensure guest modules have zero access to
+    host system calls, environment variables, or unauthorized network sockets.
+
+7.2 Performance Benchmarking Metrics
+
+  - Micro-benchmarks: Time measurement per tick stage (packet ingestion,
+    physics, ECS dispatch, WASM event dispatch, network serialization).
+  - Throughput Testing: Measure frames-per-second / ticks-per-second curves
+    with 100, 250, 500, and 1,000 synthetic bot connections.
+  - Memory Profiling: Ensure zero heap fragmentation and constant-time memory
+    ceilings during long-duration endurance runs.
+
+8. Risk Assessment & Mitigation
+
+| Identified Risk                    | Impact | Mitigation Strategy                                                                                                                                                           |
+| :--------------------------------- | :----- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Protocol Churn on Game Updates** | High   | Abstract protocol definitions into an isolated sub-crate; implement automated schema validation against new releases.                                                         |
+| **FFI Crossing Overhead**          | Medium | Batch event notifications and utilize direct shared-memory regions for bulk state transfers rather than executing high-frequency scalar FFI calls.                            |
+| **Mod Complexity vs. WASM Limits** | Medium | Expose optimized batch host functions for complex spatial operations (e.g., pathfinding, bulk block modifications) so expensive calculations run natively in the host engine. |
+| **Asset Desynchronization**        | Low    | Generate deterministic asset hashes upon boot; enforce strict client configuration-stage handshakes before admitting players into the world.                                  |
+

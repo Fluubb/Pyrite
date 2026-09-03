@@ -1,0 +1,90 @@
+Here is an actionable, step-by-step setup plan to initialize the repository,
+configure legal safeguards, and scaffold the modular workspace from Day 1.
+
+Step 1: GitHub Repository & Legal Setup
+
+  - Repository Configuration:
+      - Visibility: Public
+      - Default Branch: main (with branch protection enabled requiring CI passes
+        before merging)
+  - Licensing:
+      - Add both LICENSE-MIT and LICENSE-APACHE to the root directory for
+        standard dual-licensing.
+  - Clean-Room & Contributing Guidelines (CONTRIBUTING.md):
+      - Explicitly state that all contributions must be 100% clean-room.
+      - Add a strict rule: “Submissions containing or derived from decompiled
+        Mojang bytecode, private mappings, or proprietary game assets will be
+        immediately rejected and deleted.”
+
+Step 2: Noise Control & Community Guardrails
+
+To prevent non-technical users from spamming the issue tracker early on:
+
+  - README Status Banner (README.md):
+      - Include a prominent header:
+          - Project Status: Pre-Alpha / Architecture R&D
+          - What this is: A clean-room Rust server engine and WASM modding
+            runtime.
+          - What this is NOT: Not a Forge/Fabric runner; cannot run existing
+            Java .jar modpacks.
+  - GitHub Issue Templates (.github/ISSUE_TEMPLATE/):
+      - Create two strict templates: bug_report.md and technical_rfc.md.
+      - Disable generic "Feature Requests" and keep GitHub Discussions disabled
+        until Milestone 1 or 2 is reached.
+
+Step 3: Cargo Workspace Architecture Scaffolding
+
+Initialize a multi-crate Cargo workspace in the repository root to keep
+subsystems cleanly decoupled:
+
+my-engine/
+├── .github/
+│   ├── workflows/
+│   │   └── ci.yml               # Automated CI pipeline
+│   └── ISSUE_TEMPLATE/
+│       ├── bug_report.md
+│       └── technical_rfc.md
+│
+├── crates/
+│   ├── protocol/                # Packet structures, VarInt/NBT codecs, state transitions
+│   ├── net/                     # Tokio async TCP networking, encryption, compression
+│   ├── world/                   # Chunk storage, palette bit-packing, region loading
+│   ├── ecs/                     # Spatial entity component architecture
+│   ├── modloader/               # Wasmtime runtime, sandboxing, fuel metering, FFI
+│   ├── assets/                  # Dynamic resource pack generator & asset compiler
+│   └── server/                  # Central server executable & CLI entry point
+│
+├── sdk/
+│   └── guest-rust/              # First-party SDK for mod developers
+│
+├── .gitignore
+├── Cargo.toml                   # Root workspace manifest linking all sub-crates
+├── CONTRIBUTING.md
+├── LICENSE-APACHE
+├── LICENSE-MIT
+└── README.md
+
+Step 4: Automated CI Pipeline (.github/workflows/ci.yml)
+
+Set up a standard GitHub Actions workflow that runs on every pull request and
+push to main:
+
+1.  Format Check: Enforces uniform code style across all workspace crates.
+2.  Clippy Linter: Catches common Rust anti-patterns, performance pitfalls, and
+    unnecessary allocations.
+3.  Automated Unit Tests: Executes crate-level tests across multiple operating
+    systems (Linux, macOS, Windows).
+4.  Clean-Room Dependency Audit: Validates that all third-party crates have
+    permissive, open-source licenses (MIT, Apache-2.0, BSD).
+
+Step 5: Day-1 Execution Checklist
+
+- [ ] Initialize Git & GitHub Repo: Create the public repository with
+  dual-license files.
+- [ ] Push Scaffolding: Commit the empty Cargo workspace layout and .gitignore.
+- [ ] Set Up Branch Protection: Require the CI workflow to pass before any
+  branch can merge into main.
+- [ ] Add Readme & Contribution Policies: Add the pre-alpha warning banner and
+  clean-room notice.
+- [ ] Kick off Milestone 1: Begin work inside crates/protocol implementing the
+  baseline Handshake and Status (Server List Ping) packet definitions.
