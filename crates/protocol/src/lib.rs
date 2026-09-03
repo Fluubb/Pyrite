@@ -10,8 +10,10 @@
 
 pub mod buf;
 pub mod error;
+pub mod packets;
 pub mod varint;
 pub mod version;
 
 pub use error::{Direction, ProtocolError, State};
+pub use packets::Packet;
 pub use version::{PROTOCOL_VERSION, VERSION_NAME};
