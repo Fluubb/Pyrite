@@ -8,6 +8,7 @@
 //! reverse-engineering of the wire format. No proprietary bytecode, decompiled
 //! source, or private mapping was consulted.
 
+pub mod buf;
 pub mod error;
 pub mod varint;
 pub mod version;
