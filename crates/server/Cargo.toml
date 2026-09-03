@@ -1,0 +1,23 @@
+[package]
+name = "pyrite-server"
+description = "The Pyrite server executable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pyrite-server"
+path = "src/main.rs"
+
+[dependencies]
+pyrite-net.workspace = true
+pyrite-protocol.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

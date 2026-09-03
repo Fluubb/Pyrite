@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Not a support forum
+    url: https://github.com/pyrite-engine/pyrite/blob/main/README.md
+    about: Pyrite is pre-alpha and cannot run Java mods. Please read the README before opening an issue.

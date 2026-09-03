@@ -134,8 +134,11 @@ alone do not.
 ## 5. `crates/protocol`
 
 Depends only on `bytes`, `tokio-util`, `serde`, `serde_json`, `thiserror`.
-No Tokio runtime dependency: this crate is pure codec and must stay usable
-from a non-async context (the future client's meshing threads, fuzz targets).
+Executor-free: the crate contains no `async fn` and no `.await`, and must stay
+usable from a non-async context (the future client's meshing threads, fuzz
+targets). It does transitively link the `tokio` crate through `tokio-util`'s
+codec feature, but without the `rt` feature, so no executor is compiled in and
+no runtime is required to use it.
 
 ### 5.1 `varint.rs`
 
@@ -190,8 +193,16 @@ Decoder algorithm:
 2. Reject `length` that is negative or exceeds `MAX_PACKET_SIZE`
    (2 097 151 bytes — the maximum a three-byte length VarInt can express) with
    `ProtocolError::FrameTooLarge`.
-3. If fewer than `header_len + length` bytes are buffered, `reserve` the
-   shortfall and return `Ok(None)`.
+3. If fewer than `header_len + length` bytes are buffered, `reserve` towards
+   the shortfall in bounded steps (`MAX_SPECULATIVE_RESERVE`, 8 KiB) rather
+   than reserving the full shortfall at once, and return `Ok(None)`. `length`
+   is a peer-controlled claim, not bytes actually received: a naive
+   `reserve(shortfall)` lets three bytes of traffic (a VarInt declaring the
+   maximum frame size) commit ~2 MiB of resident memory per connection before
+   a single further byte arrives. Bounding the reserve means memory tracks
+   bytes actually received; `BytesMut` still grows as more real data arrives,
+   so this does not change how large a legitimate frame may be, only how
+   eagerly the server pre-commits memory to an unproven claim.
 4. Split off exactly one frame, read the packet id VarInt from its front, and
    yield `RawPacket { id, body: Bytes }`.
 
@@ -256,7 +267,6 @@ pub enum ProtocolError {
     FrameTooLarge { len: usize, max: usize },
     StringTooLong { len: usize, max: usize },
     InvalidUtf8(#[from] std::str::Utf8Error),
-    UnknownPacket { state: State, direction: Direction, id: i32 },
     InvalidNextState(i32),
     Json(#[from] serde_json::Error),
     Io(#[from] std::io::Error),
@@ -297,7 +307,9 @@ pub struct Connection<S: AsyncRead + AsyncWrite + Unpin> {
 
 `run()` loops: read a `RawPacket`, dispatch on `(state, id)`, write any
 response. Dispatch is a hand-written match; an unmatched pair yields
-`ProtocolError::UnknownPacket` and closes the connection.
+`NetError::UnexpectedPacket` and closes the connection. Dispatch is a net-layer
+concern — the protocol crate owns no dispatch table — so the unknown-packet
+error belongs to `NetError`, not `ProtocolError`.
 
 Two additions the source plans omit, both required for a socket exposed on a
 public port:
@@ -317,10 +329,22 @@ After `PongResponse` is flushed the connection closes normally, per §3.
 ### 6.3 Error policy
 
 No `unwrap`, `expect`, or panic on any path reachable from network input.
-Connection-level errors are logged at `warn` (protocol violations) or `debug`
-(ordinary disconnects) and terminate only that connection's task. The workspace
+Error variants carry their cause in their `Display` output (`{0}`), so a log
+line names the actual failure rather than a category. Connection-level errors
+are logged at `warn` (protocol violations) or `debug` (ordinary disconnects,
+resets, and idle timeouts — note these arrive wrapped as
+`NetError::Protocol(ProtocolError::Io(..))`, since the codec's error type is
+`ProtocolError`). Logging every disconnect at `warn` would let one SYN buy one
+warn line indefinitely, so the split is a resource concern, not just tidiness.
+
+Every connection error terminates only that connection's task. The workspace
 lint table denies `clippy::unwrap_used` and `clippy::expect_used` in these
 crates to enforce this mechanically rather than by review.
+
+Note that `panic = "abort"` in the release profile means a panic in any
+connection task would abort the whole process rather than being isolated to
+that task. No panic is reachable today — the clippy denies above are what make
+that true — but the isolation claim holds only while that remains so.
 
 ---
 
@@ -333,9 +357,15 @@ crates to enforce this mechanically rather than by review.
 2. `clap` derive CLI: `--bind` (default `0.0.0.0:25565`), `--motd`,
    `--max-players`, all with environment-variable fallbacks.
 3. Bind `TcpListener`; log the bound address and the advertised version.
-4. Accept loop: `tokio::spawn` per connection, `ServerConfig` shared as `Arc`,
+4. A bounded connection cap (`--max-connections`, default 1000) enforced with a
+   `tokio::sync::Semaphore`; a permit is acquired before spawning and held by
+   the connection task. Without it, peer SYNs drive unbounded task and buffer
+   growth. Accept loop: `tokio::spawn` per connection, `ServerConfig` shared as `Arc`,
    per-task errors logged and never propagated into the accept loop.
-5. `tokio::signal::ctrl_c` triggers graceful shutdown; the accept loop stops
+5. `tokio::signal::ctrl_c` triggers graceful shutdown. Connection tasks are
+   tracked in a `JoinSet` and awaited to completion under a bounded grace
+   period — simply returning from `main` drops the runtime, which stops tasks
+   at their next await point rather than letting them finish. The accept loop stops
    and in-flight connections are allowed to finish.
 
 An accept error is logged and the loop continues — a single failed accept
