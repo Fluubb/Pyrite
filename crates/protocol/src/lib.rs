@@ -7,3 +7,9 @@
 //! Everything here is derived solely from open, publicly documented
 //! reverse-engineering of the wire format. No proprietary bytecode, decompiled
 //! source, or private mapping was consulted.
+
+pub mod error;
+pub mod version;
+
+pub use error::{Direction, ProtocolError, State};
+pub use version::{PROTOCOL_VERSION, VERSION_NAME};
