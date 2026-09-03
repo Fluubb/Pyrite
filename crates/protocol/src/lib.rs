@@ -11,6 +11,7 @@
 pub mod buf;
 pub mod error;
 pub mod packets;
+pub mod text;
 pub mod varint;
 pub mod version;
 
