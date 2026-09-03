@@ -9,6 +9,7 @@
 //! source, or private mapping was consulted.
 
 pub mod error;
+pub mod varint;
 pub mod version;
 
 pub use error::{Direction, ProtocolError, State};
