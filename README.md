@@ -13,7 +13,8 @@ WebAssembly interface instead. It ships no game assets.
 
 ## Status
 
-Milestone 1 (in progress): protocol foundations and Server List Ping.
+Milestone 1 complete: the server answers the Server List Ping. Login, world
+storage, and the WASM mod runtime are not implemented.
 
 ## Building
 
