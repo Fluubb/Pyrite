@@ -14,6 +14,15 @@ use crate::varint::{read_varint, read_varint_slice, write_varint};
 /// width. Anything larger is treated as a malformed or hostile peer.
 pub const MAX_PACKET_SIZE: usize = 2_097_151;
 
+/// Upper bound on how much capacity a single incomplete frame may speculatively
+/// reserve.
+///
+/// A frame's declared length is peer-controlled, so growing the buffer to the
+/// declared size would let three bytes of traffic cost megabytes of resident
+/// memory. Reserving in bounded steps means a peer must actually send the bytes
+/// it promised before the server commits memory to them.
+const MAX_SPECULATIVE_RESERVE: usize = 8 * 1024;
+
 /// A decoded frame: its packet ID and its still-encoded body.
 ///
 /// `body` is a [`Bytes`] slice sharing the read buffer's allocation, so
@@ -105,9 +114,16 @@ impl Decoder for PacketCodec {
 
         let frame_len = prefix_len + body_len;
         if src.len() < frame_len {
-            // Tell the buffer how much more we need so it grows once rather
-            // than repeatedly as bytes trickle in.
-            src.reserve(frame_len - src.len());
+            // Reserve towards the shortfall, but never more than
+            // `MAX_SPECULATIVE_RESERVE` at a time: `frame_len` is only a claim
+            // the peer has made, not bytes it has actually sent. Capping the
+            // reserve means memory tracks bytes received, not bytes promised,
+            // so three bytes of traffic can no longer commit megabytes of
+            // resident memory. `BytesMut` still grows further as real data
+            // keeps arriving, so a large legitimate frame decodes correctly —
+            // it just costs one reservation per 8 KiB instead of one giant
+            // upfront reservation.
+            src.reserve((frame_len - src.len()).min(MAX_SPECULATIVE_RESERVE));
             return Ok(None);
         }
 
