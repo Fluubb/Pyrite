@@ -1,0 +1,18 @@
+[package]
+name = "pyrite-nbt"
+description = "Clean-room implementation of the NBT binary format."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "pyrite_nbt"
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
