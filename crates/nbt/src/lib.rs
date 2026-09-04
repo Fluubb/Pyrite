@@ -12,6 +12,7 @@
 //! separate functions rather than a flag.
 
 pub mod error;
+pub mod macros;
 pub mod read;
 pub mod tag;
 pub mod write;
