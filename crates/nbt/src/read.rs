@@ -91,14 +91,18 @@ fn read_length<B: Buf>(src: &mut B, min_element_size: usize) -> Result<usize, Nb
     let declared = src.get_i32();
     let len = usize::try_from(declared).map_err(|_| NbtError::NegativeLength(declared))?;
 
-    let required = len
-        .checked_mul(min_element_size)
-        .ok_or(NbtError::LengthExceedsInput {
-            // Saturating so this branch reports bytes like the one below,
-            // rather than a raw element count the message would misdescribe.
-            declared: len.saturating_mul(min_element_size),
-            remaining: src.remaining(),
-        })?;
+    let required =
+        len.checked_mul(min_element_size)
+            .ok_or_else(|| NbtError::LengthExceedsInput {
+                // Unreachable on 64-bit; kept for 32-bit targets, where the
+                // product can overflow `usize`. Report the raw element count
+                // rather than a saturated byte figure: a saturated
+                // `usize::MAX` would read as a bug in the error rather than
+                // what actually happened, which is that the multiplication
+                // overflowed.
+                declared: len,
+                remaining: src.remaining(),
+            })?;
 
     if required > src.remaining() {
         return Err(NbtError::LengthExceedsInput {
@@ -139,6 +143,7 @@ fn read_compound_body<B: Buf>(
     loop {
         let id = read_tag_id(src)?;
         if id == TagId::End {
+            reject_duplicate_keys(&compound)?;
             return Ok(compound);
         }
         let name = read_nbt_string(src)?;
@@ -147,9 +152,40 @@ fn read_compound_body<B: Buf>(
         // duplicates in place, which makes decoding an N-entry compound cost
         // O(N^2) string comparisons. A peer controls N, so a single
         // maximum-size document measured at roughly ninety seconds of blocked
-        // cpu before this changed.
+        // cpu before this changed. `push` can let duplicates survive, which
+        // is why the whole compound is checked once above, after the loop.
         compound.push(name, value);
     }
+}
+
+/// Rejects a compound holding two entries with the same name.
+///
+/// Runs once per compound, after every entry has been read, rather than as a
+/// per-entry scan -- an O(N log N) sort-and-compare over the finished
+/// compound, not the O(N^2) pairwise scan `NbtCompound::insert` would cost if
+/// called per entry. At the largest permitted compound this is tens of
+/// milliseconds, against the roughly ninety seconds the quadratic path cost.
+///
+/// A compound admitting duplicates would leave its own API disagreeing about
+/// what the document says -- see [`NbtError::DuplicateKey`] -- so this must
+/// reject rather than silently keep one copy.
+fn reject_duplicate_keys(compound: &NbtCompound) -> Result<(), NbtError> {
+    if compound.len() < 2 {
+        return Ok(());
+    }
+
+    let mut names: Vec<&str> = compound.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+
+    for pair in names.windows(2) {
+        if pair[0] == pair[1] {
+            return Err(NbtError::DuplicateKey {
+                name: pair[0].to_owned(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Reads one tag's payload, given its already-decoded type.
@@ -539,18 +575,57 @@ mod tests {
     }
 
     #[test]
-    fn a_large_flat_compound_decodes_in_linear_time() {
-        // Regression for a quadratic decode. NbtCompound::insert scans every
-        // existing entry to replace duplicates in place; calling it once per
-        // entry made decoding an N-entry compound cost O(N^2) string
-        // comparisons. A peer controls N, so a single maximum-size document
-        // measured at roughly ninety seconds of blocked cpu. The decoder now
-        // appends instead.
+    fn duplicate_keys_are_rejected_not_silently_collapsed() {
+        // Deterministic regression for the quadratic-decode fix and its
+        // fallout. `NbtCompound::insert` scanned every existing entry to
+        // replace duplicates in place -- O(N^2) over an N-entry compound, a
+        // peer-controlled N, roughly ninety seconds of blocked cpu for one
+        // maximum-size document. The decoder now appends (`push`) instead,
+        // which is linear, but `push` by itself lets duplicate names survive
+        // into a compound whose own API then disagrees with itself: `get`
+        // answers with the first match, iteration yields the last. `insert`
+        // could never produce this assertion's failure mode because it
+        // silently collapsed duplicates down to one entry; `push` alone would
+        // pass this document through with all of them. The decoder must
+        // reject it instead.
         //
-        // The bound is deliberately generous: this catches a return to
-        // quadratic behaviour, it does not measure performance. The quadratic
-        // version took over two seconds for this input in release and far
-        // longer unoptimised.
+        // This is deterministic and instant, unlike a wall-clock bound: it
+        // fails the same way on every machine, in debug or release, on a
+        // loaded CI runner or an idle one.
+        const ENTRIES: usize = 40_000;
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        for _ in 0..ENTRIES {
+            buf.put_u8(0x01); // byte
+            buf.put_u16(1);
+            buf.put_slice(b"k");
+            buf.put_i8(1);
+        }
+        buf.put_u8(0x00);
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::DuplicateKey { name }) if name == "k"
+        ));
+    }
+
+    #[test]
+    fn a_large_flat_compound_with_distinct_keys_decodes_quickly() {
+        // Secondary signal alongside the deterministic duplicate-key
+        // assertion above: distinct names never trip the duplicate check, so
+        // this instead measures throughput on the healthy decode path.
+        //
+        // The bound is tight, not generous: the healthy path takes
+        // single-digit milliseconds for this input, so two seconds already
+        // leaves roughly two orders of magnitude of headroom. A prior version
+        // of this test allowed ten seconds and passed at 9.54s after the
+        // quadratic bug it existed to catch was deliberately reintroduced --
+        // headroom that wide made the bound worthless as a regression guard
+        // and flaky against a merely slow runner. The duplicate-key test is
+        // the primary guard against the regression; this one only confirms
+        // the fix didn't also cost throughput.
         const ENTRIES: usize = 40_000;
 
         let mut buf = BytesMut::new();
@@ -571,8 +646,8 @@ mod tests {
 
         assert_eq!(decoded.len(), ENTRIES);
         assert!(
-            elapsed < std::time::Duration::from_secs(10),
-            "decoding {ENTRIES} entries took {elapsed:?}, which suggests the              quadratic path is back"
+            elapsed < std::time::Duration::from_secs(2),
+            "decoding {ENTRIES} distinct entries took {elapsed:?}, which suggests the quadratic path is back"
         );
     }
 
@@ -580,7 +655,7 @@ mod tests {
     fn a_document_exceeding_the_node_budget_is_rejected() {
         // A list of empty compounds costs one wire byte per element but a
         // whole NbtTag per element, so without a node budget a small document
-        // expands roughly fortyfold in memory.
+        // expands far out of proportion to its wire size.
         let mut buf = BytesMut::new();
         buf.put_u8(0x0a);
         buf.put_u8(0x09); // list
@@ -622,5 +697,57 @@ mod tests {
             "expected a list of 1000 elements, got {:?}",
             decoded.get("l").map(NbtTag::id)
         );
+    }
+
+    #[test]
+    fn a_document_at_exactly_the_node_budget_decodes() {
+        // Boundary check on the budget sized against the memory-densest
+        // shape (see MAX_TOTAL_NODES's doc comment): the limit rejects
+        // anything *over* budget, not the budget count itself. One node here
+        // is the list tag; the rest are its elements.
+        let element_count = MAX_TOTAL_NODES - 1;
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x09); // list
+        buf.put_u16(1);
+        buf.put_slice(b"l");
+        buf.put_u8(0x0a); // of compounds
+        buf.put_i32(element_count as i32);
+        for _ in 0..element_count {
+            buf.put_u8(0x00);
+        }
+        buf.put_u8(0x00); // terminates the root compound
+
+        let mut src = &buf[..];
+        let decoded = read_network_root(&mut src).unwrap();
+        assert!(
+            matches!(decoded.get("l"), Some(NbtTag::List(list)) if list.len() == element_count),
+            "a document totalling exactly MAX_TOTAL_NODES nodes must still decode"
+        );
+    }
+
+    #[test]
+    fn a_document_one_node_over_the_budget_is_rejected() {
+        // The other side of the same boundary: one more node than the budget
+        // must fail, not merely "enough more to notice".
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x09); // list
+        buf.put_u16(1);
+        buf.put_slice(b"l");
+        buf.put_u8(0x0a); // of compounds
+        buf.put_i32(MAX_TOTAL_NODES as i32);
+        for _ in 0..MAX_TOTAL_NODES {
+            buf.put_u8(0x00);
+        }
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::TooManyNodes {
+                max: MAX_TOTAL_NODES
+            })
+        ));
     }
 }

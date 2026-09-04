@@ -157,7 +157,11 @@ copies. `IntArray` and `LongArray` hold `Vec` because their elements need
 byte-swapping out of the big-endian wire form and cannot be borrowed directly.
 
 `NbtCompound` wraps `Vec<(String, NbtTag)>` and exposes `get(&str)`,
-`insert`, `len`, `is_empty`, and iteration (D17).
+`insert`, `len`, `is_empty`, and iteration (D17). It also has a crate-private
+`push`, which appends without checking for an existing key; the decoder is
+its only caller (§5), and it is not `pub` because a document holding
+duplicate names lets `get` and iteration disagree about the same bytes,
+which is exactly the invariant `insert` exists to enforce.
 
 `NbtList` carries its element `TagId` alongside `Vec<NbtTag>`, so a list's
 declared type survives a round trip even when empty. A list built through the
@@ -208,6 +212,15 @@ reachable from input, so both writers return `Result<(), NbtError>`. The
 list-homogeneity invariant *is* enforced at construction as originally
 described, so it needs no writer check.
 
+**Amended again after an independent review.** The writer had no depth guard
+of its own, so a hand-built tree deeper than `MAX_DEPTH` — the same limit the
+reader enforces — would overflow the stack on write rather than fail cleanly,
+fatal under `panic = "abort"`. The writer now threads a depth counter through
+`write_compound_body` and `write_payload` exactly as the reader does, and
+returns `NbtError::DepthExceeded` past the limit; both public writers already
+returned `Result`, so this needed no signature change. Milestone 4's registry
+generation is exactly the code that would trip this.
+
 ### 4.4 `macros.rs`
 
 ```rust
@@ -254,21 +267,51 @@ is additionally capped at `MAX_PREALLOC_ELEMENTS` (64, matching the existing
 convention in `protocol/src/buf.rs`), so the vector grows with real data
 rather than with the claim.
 
-**Node budget — `MAX_TOTAL_NODES = 524_288`.** Added after the final review.
-Depth bounds a document's *nesting*; nothing bounded its *size*. A list of
-empty compounds costs one wire byte per element but a whole `NbtTag` per
-element, so a maximum-size frame expanded roughly fortyfold in memory, and
-more transiently while the backing vector reallocated. The budget is threaded
-through decoding exactly as `depth` is.
+**Node budget — `MAX_TOTAL_NODES = 65_536`.** Added after the final review,
+then re-sized after an independent review of that fix. Depth bounds a
+document's *nesting*; nothing bounded its *size*. The budget must be sized
+against the memory-densest shape a document can take, not the cheapest one:
+a list of empty compounds costs one wire byte per node, but a compound
+*entry* — a name and a value, which is what a flat document is actually made
+of — costs as little as 4 wire bytes on the wire while occupying
+`size_of::<(String, NbtTag)>()` = 64 bytes once decoded (`size_of::<NbtTag>()`
+alone is 40). A budget sized against the list shape binds two nodes *after*
+`MAX_PACKET_SIZE` does on the entry shape, so it can never fire on the input
+that costs the most memory. At `1 << 16` the entry shape caps a decoded
+document at roughly 4 MiB of tree — and fires at 256 KiB of input on that
+shape, eight times before `MAX_PACKET_SIZE` rather than two nodes after it.
+The budget is threaded through decoding exactly as `depth` is.
 
-**Compounds decode by appending, not by inserting.** Added after the final
-review. `NbtCompound::insert` scans existing entries to replace duplicates in
-place, which is right for hand-built documents and catastrophic in a decoder:
-calling it per entry made decoding an N-entry compound cost O(N²) string
-comparisons, measured at roughly ninety seconds of blocked CPU for one
-maximum-size document. The decoder uses an append-only path. NBT forbids
-duplicate names, so a document containing them is already malformed and
-keeping both rather than rejecting is a policy choice, not a correctness one.
+The remaining margin is smaller than it first appears, and the earlier claim
+of twentyfold headroom over "the few thousand tags a real registry document
+contains" was optimistic. A full vanilla registry codec is plausibly ten to
+thirty thousand tags, putting the real margin nearer three to sixfold, and a
+datapack carrying many custom biomes could approach the budget. Milestone 4
+should re-measure this against an actual registry document rather than
+re-estimating it.
+
+**Compounds decode by appending, not by inserting, and a duplicate name is
+rejected once the compound is complete.** Added after the final review, then
+corrected after an independent review of that fix. `NbtCompound::insert`
+scans existing entries to replace duplicates in place, which is right for
+hand-built documents and catastrophic in a decoder: calling it per entry made
+decoding an N-entry compound cost O(N²) string comparisons, measured at
+roughly ninety seconds of blocked CPU for one maximum-size document. The
+decoder uses an append-only path (`NbtCompound::push`, crate-private) to keep
+that cost linear.
+
+Appending alone, though, lets a document with duplicate names decode
+successfully into a compound whose own API then disagrees with itself:
+`get` returns the first match, iteration (or collecting into a map) yields
+the last. Two consumers of the same bytes — say, a handler that validates by
+iterating and one that reads a field with `get` — would then see different
+values for the same key from the same document, which is the shape of a
+request-smuggling bug once Milestone 4 makes this reachable from an
+unauthenticated connection. NBT forbids duplicate names, so keeping either
+reading is wrong; the decoder instead scans the finished compound for
+duplicates once, after every entry has been read (an O(N log N)
+sort-and-compare, not a per-entry scan), and rejects the document with
+`NbtError::DuplicateKey` if it finds one.
 
 These two guards are a different shape from the rest of this section, and the
 difference is worth naming. Everything above bounds *allocation proportional
@@ -304,13 +347,15 @@ pub enum NbtError {
     StringTooLong { len: usize },
     ArrayTooLong { len: usize },
     TooManyNodes { max: usize },
+    DuplicateKey { name: String },
     InvalidUtf8(std::str::Utf8Error),
 }
 ```
 
 `HeterogeneousList` and `StringTooLong` arrived with the writer's `Result`
 return (§4.3); `ArrayTooLong` and `TooManyNodes` with the bounds added after
-the final review (§5).
+the final review (§5); `DuplicateKey` with the correction to that fix after
+an independent review (§5).
 
 `NbtError` is the crate's own type. `pyrite-protocol` gains
 `ProtocolError::Nbt(#[from] NbtError)`, so a malformed document reaching the

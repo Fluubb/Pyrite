@@ -18,12 +18,22 @@ pub const MAX_DEPTH: usize = 512;
 /// Bounds the *tree*, where [`MAX_DEPTH`] bounds only its *nesting*. The two
 /// are independent: a flat document one level deep can still be enormous.
 ///
-/// A list of empty compounds costs one wire byte per element but one `NbtTag`
-/// per element, so without this a maximum-size frame expands roughly fortyfold
-/// in memory -- and more than that transiently, while the backing vector
-/// reallocates. Real registry documents contain a few thousand tags, so this
-/// leaves about a hundredfold margin.
-pub const MAX_TOTAL_NODES: usize = 1 << 19;
+/// Sized from the memory-densest shape, not the cheapest one. A list of empty
+/// compounds costs one wire byte per node; a compound *entry* -- a name and a
+/// value, which is what a flat document is actually made of -- costs as
+/// little as 4 wire bytes (a type byte, a zero-length `u16` name, one payload
+/// byte) but occupies `size_of::<(String, NbtTag)>()` = 64 bytes once
+/// decoded, since `size_of::<NbtTag>()` alone is 40. A budget sized against
+/// the list shape would let a maximum-size frame smuggle through roughly two
+/// nodes' worth more of the entry shape than the budget was meant to permit,
+/// which defeats the point of having one.
+///
+/// At `1 << 16` (65,536) nodes, the worst-case (compound-entry) shape caps a
+/// decoded document at 65,536 * 64 bytes = 4 MiB of tree, plus the transient
+/// doubling of the backing `Vec` during the last few reallocations. Real
+/// registry documents contain a few thousand tags, so this still leaves
+/// roughly twentyfold margin over real usage.
+pub const MAX_TOTAL_NODES: usize = 1 << 16;
 
 /// Every way NBT encoding or decoding can fail.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +96,21 @@ pub enum NbtError {
     TooManyNodes {
         /// The node budget that was exhausted.
         max: usize,
+    },
+
+    /// A compound contained two entries with the same name.
+    ///
+    /// NBT forbids duplicate names in a compound. Admitting them anyway would
+    /// leave the compound's own API disagreeing with itself about what the
+    /// document says: [`crate::NbtCompound::get`] answers with the first
+    /// match, while iterating (or collecting into a map) yields the last. Two
+    /// consumers of the same bytes could then observe different values for
+    /// the same key, so a duplicate is rejected rather than admitted under
+    /// either reading.
+    #[error("nbt compound contains a duplicate key: {name:?}")]
+    DuplicateKey {
+        /// The name that appeared more than once.
+        name: String,
     },
 
     /// An array or list held more elements than its `i32` length can express.
