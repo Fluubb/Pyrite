@@ -73,3 +73,49 @@ impl NetError {
         matches!(self, Self::Timeout | Self::Protocol(ProtocolError::Io(_)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn genuine_transport_failures_are_noise() {
+        let io = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(NetError::Protocol(ProtocolError::Io(io)).is_transport_noise());
+        assert!(NetError::Timeout.is_transport_noise());
+    }
+
+    #[test]
+    fn a_corrupt_compressed_payload_is_not_noise() {
+        // Regression: a corrupt deflate stream is reported by the decompressor
+        // as an io::Error. If it reached ProtocolError::Io it would be filed as
+        // a hung-up socket and logged at debug, so a peer feeding garbage into
+        // the compressed slot after login would be invisible at the default
+        // log level. It must have its own variant and reach warn.
+        let error = NetError::Protocol(ProtocolError::Decompression {
+            reason: "corrupt deflate stream".to_owned(),
+        });
+        assert!(
+            !error.is_transport_noise(),
+            "a corrupt compressed payload is a protocol violation, not noise"
+        );
+    }
+
+    #[test]
+    fn protocol_violations_are_not_noise() {
+        for error in [
+            NetError::UnexpectedPacket {
+                state: State::Status,
+                id: 0x7f,
+            },
+            NetError::DuplicateStatusRequest,
+            NetError::InvalidUsername {
+                name: "has space".to_owned(),
+            },
+        ] {
+            assert!(!error.is_transport_noise(), "{error} must reach warn");
+        }
+    }
+}
