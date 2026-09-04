@@ -15,4 +15,4 @@ pub mod error;
 pub mod tag;
 
 pub use error::{MAX_DEPTH, NbtError};
-pub use tag::TagId;
+pub use tag::{NbtCompound, NbtList, NbtTag, TagId};
