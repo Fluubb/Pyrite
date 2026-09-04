@@ -48,6 +48,13 @@ pub enum NetError {
     #[error("duplicate status request")]
     DuplicateStatusRequest,
 
+    /// The client asked to log in under a name the server will not accept.
+    #[error("invalid username {name:?}")]
+    InvalidUsername {
+        /// The rejected name.
+        name: String,
+    },
+
     /// The peer sent nothing for longer than the configured read timeout.
     #[error("connection timed out waiting for a packet")]
     Timeout,

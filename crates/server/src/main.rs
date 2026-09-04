@@ -61,6 +61,44 @@ struct Args {
     /// Seconds to let in-flight connections finish after a shutdown signal.
     #[arg(long, env = "PYRITE_SHUTDOWN_GRACE", default_value_t = 5)]
     shutdown_grace: u64,
+
+    /// Size at or above which packets are compressed. Negative disables
+    /// compression entirely.
+    #[arg(long, env = "PYRITE_COMPRESSION_THRESHOLD", default_value_t = 256)]
+    compression_threshold: i32,
+
+    /// Permit binding a non-loopback address while authentication is
+    /// unimplemented.
+    ///
+    /// Without this, the server refuses to listen anywhere but loopback,
+    /// because offline mode lets any client join under any username.
+    #[arg(long, env = "PYRITE_INSECURE_OFFLINE_MODE", default_value_t = false)]
+    insecure_offline_mode: bool,
+}
+
+/// Refuses a non-loopback bind while the server can only run in offline mode.
+///
+/// Offline mode authenticates nobody: any client may join under any username,
+/// including one that has been granted operator rights. Until authentication
+/// lands, exposing the server on a public interface has to be a deliberate act
+/// rather than the default, so the check lives at startup where it cannot be
+/// reached around.
+fn check_bind_safety(addr: SocketAddr, insecure_offline_mode: bool) -> Result<(), String> {
+    if insecure_offline_mode || addr.ip().is_loopback() {
+        return Ok(());
+    }
+
+    Err(format!(
+        concat!(
+            "refusing to bind {addr}: this server runs in offline mode, so any ",
+            "client could join under any username, including one holding ",
+            "operator rights. Bind a loopback address such as 127.0.0.1:{port} ",
+            "instead, or pass --insecure-offline-mode if you genuinely intend ",
+            "to expose it."
+        ),
+        addr = addr,
+        port = addr.port()
+    ))
 }
 
 #[tokio::main]
@@ -74,10 +112,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    if let Err(message) = check_bind_safety(args.bind, args.insecure_offline_mode) {
+        error!("{message}");
+        std::process::exit(1);
+    }
+
+    if args.insecure_offline_mode && !args.bind.ip().is_loopback() {
+        warn!(
+            address = %args.bind,
+            "listening publicly in offline mode: any client can join under any username"
+        );
+    }
+
     let config = Arc::new(ServerConfig {
         motd: TextComponent::new(args.motd),
         max_players: args.max_players,
         read_timeout: Duration::from_secs(args.read_timeout),
+        compression_threshold: (args.compression_threshold >= 0)
+            .then_some(args.compression_threshold),
     });
 
     // Bounds concurrent connections. A permit is acquired before the task is
@@ -175,4 +227,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_binds_need_no_flag() {
+        assert!(check_bind_safety(addr("127.0.0.1:25565"), false).is_ok());
+        assert!(check_bind_safety(addr("[::1]:25565"), false).is_ok());
+    }
+
+    #[test]
+    fn public_binds_are_refused_without_the_flag() {
+        for text in ["0.0.0.0:25565", "192.168.1.10:25565", "[::]:25565"] {
+            let result = check_bind_safety(addr(text), false);
+            assert!(result.is_err(), "{text} must be refused");
+            let message = result.unwrap_err();
+            assert!(
+                message.contains("--insecure-offline-mode"),
+                "the error must name the flag that overrides it, got {message}"
+            );
+            assert!(
+                message.contains("any username"),
+                "the error must say what the risk actually is, got {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_binds_are_permitted_with_the_flag() {
+        assert!(check_bind_safety(addr("0.0.0.0:25565"), true).is_ok());
+    }
 }

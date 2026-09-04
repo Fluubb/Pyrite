@@ -14,7 +14,6 @@ use futures_util::{SinkExt, StreamExt};
 use pyrite_net::{Connection, NetError, ServerConfig};
 use pyrite_protocol::codec::PacketCodec;
 use pyrite_protocol::packets::handshake::{Handshake, NextState};
-use pyrite_protocol::packets::login::LoginDisconnect;
 use pyrite_protocol::packets::status::{
     PingRequest, PongResponse, StatusRequest, StatusResponse, StatusResponseJson,
 };
@@ -27,6 +26,7 @@ fn config() -> Arc<ServerConfig> {
         motd: TextComponent::new("A Pyrite Server"),
         max_players: 100,
         read_timeout: Duration::from_secs(5),
+        compression_threshold: None,
     })
 }
 
@@ -85,25 +85,6 @@ async fn ping_without_a_status_request_is_accepted() {
     let frame = client.next().await.unwrap().unwrap();
     let pong: PongResponse = frame.decode_as().unwrap();
     assert_eq!(pong.payload, -1);
-    task.await.unwrap().unwrap();
-}
-
-#[tokio::test]
-async fn login_receives_a_graceful_disconnect() {
-    let (client, server) = tokio::io::duplex(4096);
-    let task = tokio::spawn(Connection::new(server, config()).run());
-    let mut client = Framed::new(client, PacketCodec::new());
-
-    client.send(handshake(NextState::Login)).await.unwrap();
-
-    let frame = client.next().await.unwrap().unwrap();
-    assert_eq!(frame.id, LoginDisconnect::ID);
-    let disconnect: LoginDisconnect = frame.decode_as().unwrap();
-    let reason: serde_json::Value = serde_json::from_str(&disconnect.reason).unwrap();
-    assert!(
-        reason["text"].as_str().unwrap().contains("not implemented"),
-        "the reason must explain why, got {reason}"
-    );
     task.await.unwrap().unwrap();
 }
 
