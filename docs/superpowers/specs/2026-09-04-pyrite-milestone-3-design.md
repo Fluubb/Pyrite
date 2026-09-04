@@ -278,9 +278,17 @@ of — costs as little as 4 wire bytes on the wire while occupying
 alone is 40). A budget sized against the list shape binds two nodes *after*
 `MAX_PACKET_SIZE` does on the entry shape, so it can never fire on the input
 that costs the most memory. At `1 << 16` the entry shape caps a decoded
-document at roughly 4 MiB of tree, still some twentyfold above the few
-thousand tags a real registry document contains. The budget is threaded
-through decoding exactly as `depth` is.
+document at roughly 4 MiB of tree — and fires at 256 KiB of input on that
+shape, eight times before `MAX_PACKET_SIZE` rather than two nodes after it.
+The budget is threaded through decoding exactly as `depth` is.
+
+The remaining margin is smaller than it first appears, and the earlier claim
+of twentyfold headroom over "the few thousand tags a real registry document
+contains" was optimistic. A full vanilla registry codec is plausibly ten to
+thirty thousand tags, putting the real margin nearer three to sixfold, and a
+datapack carrying many custom biomes could approach the budget. Milestone 4
+should re-measure this against an actual registry document rather than
+re-estimating it.
 
 **Compounds decode by appending, not by inserting, and a duplicate name is
 rejected once the compound is complete.** Added after the final review, then
