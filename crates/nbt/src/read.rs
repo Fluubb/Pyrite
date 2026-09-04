@@ -655,7 +655,7 @@ mod tests {
     fn a_document_exceeding_the_node_budget_is_rejected() {
         // A list of empty compounds costs one wire byte per element but a
         // whole NbtTag per element, so without a node budget a small document
-        // expands roughly fortyfold in memory.
+        // expands far out of proportion to its wire size.
         let mut buf = BytesMut::new();
         buf.put_u8(0x0a);
         buf.put_u8(0x09); // list
