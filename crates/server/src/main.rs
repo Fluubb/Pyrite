@@ -78,6 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         motd: TextComponent::new(args.motd),
         max_players: args.max_players,
         read_timeout: Duration::from_secs(args.read_timeout),
+        // Replaced by the --compression-threshold flag in the next commit.
+        compression_threshold: Some(256),
     });
 
     // Bounds concurrent connections. A permit is acquired before the task is

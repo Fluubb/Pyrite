@@ -40,14 +40,16 @@ impl ConnectionState {
 
     /// Moves to `to`, or rejects the move.
     ///
-    /// The only legal moves in Milestone 1 are out of `Handshaking` into
-    /// `Status` or `Login`. In particular `Status -> Login` is refused: a
-    /// status connection is unauthenticated and must not be able to promote
-    /// itself.
+    /// Legal moves are out of `Handshaking` into `Status` or `Login`, and from
+    /// `Login` into `Configuration` once the client acknowledges login. In
+    /// particular `Status -> Login` is refused: a status connection is
+    /// unauthenticated and must not be able to promote itself.
     pub fn transition(&mut self, to: State) -> Result<(), NetError> {
         let permitted = matches!(
             (self.current, to),
-            (State::Handshaking, State::Status) | (State::Handshaking, State::Login)
+            (State::Handshaking, State::Status)
+                | (State::Handshaking, State::Login)
+                | (State::Login, State::Configuration)
         );
 
         if !permitted {
@@ -146,6 +148,25 @@ mod tests {
         assert!(matches!(
             fsm.mark_status_request_seen(),
             Err(NetError::DuplicateStatusRequest)
+        ));
+    }
+
+    #[test]
+    fn login_may_advance_to_configuration() {
+        let mut fsm = ConnectionState::new();
+        fsm.transition(State::Login).unwrap();
+        fsm.transition(State::Configuration).unwrap();
+        assert_eq!(fsm.current(), State::Configuration);
+    }
+
+    #[test]
+    fn configuration_is_terminal_in_this_milestone() {
+        let mut fsm = ConnectionState::new();
+        fsm.transition(State::Login).unwrap();
+        fsm.transition(State::Configuration).unwrap();
+        assert!(matches!(
+            fsm.transition(State::Play),
+            Err(NetError::IllegalTransition { .. })
         ));
     }
 }

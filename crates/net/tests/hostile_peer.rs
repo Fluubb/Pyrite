@@ -25,6 +25,7 @@ fn config() -> Arc<ServerConfig> {
         motd: TextComponent::new("A Pyrite Server"),
         max_players: 100,
         read_timeout: Duration::from_secs(30),
+        compression_threshold: None,
     })
 }
 

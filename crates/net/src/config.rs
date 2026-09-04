@@ -16,6 +16,9 @@ pub struct ServerConfig {
     pub max_players: i32,
     /// How long a connection may sit idle before it is dropped.
     pub read_timeout: Duration,
+    /// Size at or above which packets are compressed, or `None` to disable
+    /// compression entirely.
+    pub compression_threshold: Option<i32>,
 }
 
 impl Default for ServerConfig {
@@ -27,6 +30,9 @@ impl Default for ServerConfig {
             // long is a stalled or hostile peer holding a task open, so it is
             // dropped rather than allowed to accumulate.
             read_timeout: Duration::from_secs(30),
+            // The conventional default. Small packets stay uncompressed, so
+            // the ping path pays nothing, while chunk data later will.
+            compression_threshold: Some(256),
         }
     }
 }
