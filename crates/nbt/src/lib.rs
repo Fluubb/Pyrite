@@ -13,6 +13,8 @@
 
 pub mod error;
 pub mod tag;
+pub mod write;
 
 pub use error::{MAX_DEPTH, NbtError};
 pub use tag::{NbtCompound, NbtList, NbtTag, TagId};
+pub use write::{write_named_root, write_network_root};
