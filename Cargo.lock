@@ -371,6 +371,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "flate2",
+ "pyrite-nbt",
  "serde",
  "serde_json",
  "thiserror",
