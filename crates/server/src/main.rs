@@ -8,13 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use pyrite_net::{Connection, ServerConfig};
+use pyrite_net::{ServeOptions, ServerConfig, serve};
 use pyrite_protocol::text::TextComponent;
 use pyrite_protocol::{PROTOCOL_VERSION, VERSION_NAME};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tracing::{Instrument, debug, error, info, info_span, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Command line options.
@@ -139,11 +138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .then_some(args.compression_threshold),
     });
 
-    // Bounds concurrent connections. A permit is acquired before the task is
-    // spawned and released when the task ends, so the accept loop can admit a
-    // new peer only once an existing one has finished.
-    let permits = Arc::new(Semaphore::new(args.max_connections as usize));
-    let mut connections = JoinSet::new();
+    let options = ServeOptions {
+        max_connections: args.max_connections as usize,
+        shutdown_grace: Duration::from_secs(args.shutdown_grace),
+    };
 
     let listener = TcpListener::bind(args.bind).await?;
     info!(
@@ -153,95 +151,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "pyrite-server listening"
     );
 
-    // Constructed once, outside the loop. `select!` re-evaluates its branch
-    // expressions every iteration, so building `ctrl_c()` inline would drop
-    // the previous future and subscribe a new listener each time the accept
-    // branch wins. A Ctrl-C landing in that window is consumed by tokio's
-    // handler -- which has already displaced the default OS behaviour -- but
-    // reaches no listener, so the server ignores it and the operator's
-    // keypress appears to do nothing.
-    let shutdown = std::pin::pin!(tokio::signal::ctrl_c());
-    let mut shutdown = shutdown;
-
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, peer)) => {
-                        // Reap finished tasks so the JoinSet does not grow
-                        // without bound over the server's lifetime.
-                        while connections.try_join_next().is_some() {}
-
-                        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                            // At capacity. Drop the socket immediately rather
-                            // than queueing: making the peer wait would let a
-                            // backlog accumulate behind the cap, which is the
-                            // resource growth the cap exists to prevent.
-                            debug!(%peer, "refusing connection, at capacity");
-                            drop(stream);
-                            continue;
-                        };
-
-                        let config = Arc::clone(&config);
-                        let span = info_span!("connection", %peer);
-                        connections.spawn(
-                            async move {
-                                if let Err(error) = Connection::new(stream, config).run().await {
-                                    // Routine peer behaviour -- idle timeouts,
-                                    // resets, truncated frames from a client
-                                    // that hung up -- is debug. Only genuine
-                                    // protocol violations warrant a warning,
-                                    // or any peer could inflate the log with a
-                                    // single SYN.
-                                    if error.is_transport_noise() {
-                                        debug!(%error, "connection closed");
-                                    } else {
-                                        warn!(%error, "connection closed with an error");
-                                    }
-                                }
-                                drop(permit);
-                            }
-                            .instrument(span),
-                        );
-                    }
-                    Err(error) => {
-                        // A failed accept (a descriptor limit, for example) must
-                        // never take the listener down with it.
-                        error!(%error, "failed to accept a connection");
-                    }
-                }
-            }
-            result = &mut shutdown => {
-                match result {
-                    Ok(()) => info!("shutdown signal received, stopping the listener"),
-                    Err(error) => error!(%error, "failed to listen for the shutdown signal"),
-                }
-                break;
-            }
+    // The accept loop lives in `pyrite-net` so it can be tested with an
+    // injected shutdown future; here that future is a real Ctrl-C.
+    let outcome = serve(listener, config, options, async {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {}
+            Err(error) => error!(%error, "failed to listen for the shutdown signal"),
         }
-    }
+    })
+    .await;
 
-    // Returning from `main` drops the runtime, which stops tasks at their next
-    // await point rather than letting them finish. Drain explicitly instead,
-    // under a bounded grace period so a stuck connection cannot hang shutdown.
-    let outstanding = connections.len();
-    if outstanding > 0 {
-        info!(outstanding, "waiting for in-flight connections to finish");
-        let grace = Duration::from_secs(args.shutdown_grace);
-        match tokio::time::timeout(grace, async {
-            while connections.join_next().await.is_some() {}
-        })
-        .await
-        {
-            Ok(()) => info!("all connections finished"),
-            Err(_elapsed) => {
-                warn!(
-                    remaining = connections.len(),
-                    "shutdown grace period expired, abandoning connections"
-                );
-            }
-        }
-    }
+    info!(
+        accepted = outcome.accepted,
+        refused = outcome.refused,
+        drained = outcome.drained,
+        "pyrite-server stopped"
+    );
 
     Ok(())
 }
