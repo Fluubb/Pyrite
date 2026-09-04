@@ -17,6 +17,7 @@ bytes = "1"
 flate2 = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+md-5 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
