@@ -4,7 +4,6 @@
 //! [`Connection`] on its own Tokio task.
 
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,8 +54,16 @@ struct Args {
     /// Expressed as `NonZeroUsize` so a zero -- which would refuse every
     /// connection -- is rejected at parse time rather than becoming a silent
     /// outage.
-    #[arg(long, env = "PYRITE_MAX_CONNECTIONS", default_value = "1000")]
-    max_connections: NonZeroUsize,
+    /// Capped at `Semaphore::MAX_PERMITS`; above that `Semaphore::new` panics
+    /// inside tokio, which with `panic = "abort"` would take the process down
+    /// instead of producing a usable error.
+    #[arg(
+        long,
+        env = "PYRITE_MAX_CONNECTIONS",
+        default_value = "1000",
+        value_parser = clap::value_parser!(u64).range(1..=Semaphore::MAX_PERMITS as u64)
+    )]
+    max_connections: u64,
 
     /// Seconds to let in-flight connections finish after a shutdown signal.
     #[arg(long, env = "PYRITE_SHUTDOWN_GRACE", default_value_t = 5)]
@@ -135,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bounds concurrent connections. A permit is acquired before the task is
     // spawned and released when the task ends, so the accept loop can admit a
     // new peer only once an existing one has finished.
-    let permits = Arc::new(Semaphore::new(args.max_connections.get()));
+    let permits = Arc::new(Semaphore::new(args.max_connections as usize));
     let mut connections = JoinSet::new();
 
     let listener = TcpListener::bind(args.bind).await?;
@@ -145,6 +152,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         protocol = PROTOCOL_VERSION,
         "pyrite-server listening"
     );
+
+    // Constructed once, outside the loop. `select!` re-evaluates its branch
+    // expressions every iteration, so building `ctrl_c()` inline would drop
+    // the previous future and subscribe a new listener each time the accept
+    // branch wins. A Ctrl-C landing in that window is consumed by tokio's
+    // handler -- which has already displaced the default OS behaviour -- but
+    // reaches no listener, so the server ignores it and the operator's
+    // keypress appears to do nothing.
+    let shutdown = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut shutdown = shutdown;
 
     loop {
         tokio::select! {
@@ -194,7 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
-            result = tokio::signal::ctrl_c() => {
+            result = &mut shutdown => {
                 match result {
                     Ok(()) => info!("shutdown signal received, stopping the listener"),
                     Err(error) => error!(%error, "failed to listen for the shutdown signal"),

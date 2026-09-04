@@ -114,6 +114,19 @@ pub enum ProtocolError {
         actual: usize,
     },
 
+    /// A compressed payload could not be inflated.
+    ///
+    /// Distinct from [`ProtocolError::Io`] on purpose. A corrupt deflate
+    /// stream is reported by the decompressor as an `io::Error`, but it is a
+    /// protocol violation by the peer, not a transport failure -- and the
+    /// networking layer classifies log severity on that distinction. Letting
+    /// it reach `Io` would file hostile traffic as routine noise.
+    #[error("decompression failed: {reason}")]
+    Decompression {
+        /// What the decompressor reported.
+        reason: String,
+    },
+
     /// A packet was compressed even though it is below the threshold at which
     /// compression is permitted.
     #[error("compressed packet of {data_length} bytes is below the {threshold} byte threshold")]
@@ -138,6 +151,12 @@ pub enum ProtocolError {
 
     /// An underlying I/O error. Required because `tokio_util::codec::Decoder`
     /// mandates `From<std::io::Error>` on its error type.
+    ///
+    /// **This variant is treated as routine transport noise and logged at
+    /// `debug`.** Only genuine transport failures belong here. Anything that
+    /// merely *reports itself* as an `io::Error` -- a decompressor, a parser,
+    /// a future codec -- must get its own variant, or a peer's misbehaviour
+    /// will be filed as a hung-up socket and never surface in the logs.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
 

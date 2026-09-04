@@ -150,7 +150,11 @@ impl PacketCodec {
         // instead of the output growing unbounded.
         let mut out = Vec::with_capacity(data_length.min(MAX_SPECULATIVE_RESERVE));
         let mut decoder = ZlibDecoder::new(frame.as_ref()).take(data_length as u64 + 1);
-        decoder.read_to_end(&mut out)?;
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|error| ProtocolError::Decompression {
+                reason: error.to_string(),
+            })?;
 
         if out.len() != data_length {
             return Err(ProtocolError::CompressedSizeMismatch {
