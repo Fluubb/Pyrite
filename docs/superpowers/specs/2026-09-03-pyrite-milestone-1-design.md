@@ -350,6 +350,16 @@ that true — but the isolation claim holds only while that remains so.
 
 ## 7. `crates/server`
 
+**Amended after the Milestone 1 independent review.** The accept loop,
+connection cap and shutdown drain now live in `pyrite_net::server::serve`, not
+in the binary. As written below they were inline in `async fn main`, which made
+them unreachable from any test — so the two controls that bound what an
+unauthenticated peer population can allocate had no coverage at all, and the
+drain rested entirely on having been read. Moving them into the library also
+lets shutdown be an injected future rather than a signal, which removes the
+need to deliver a real Ctrl-C to test it. `crates/server` keeps the CLI, the
+tracing setup, the bind-safety interlock, and the listener.
+
 `main.rs`:
 
 1. `tracing_subscriber` with `EnvFilter`, defaulting to `info`, overridable via
