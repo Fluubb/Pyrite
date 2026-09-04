@@ -4,8 +4,9 @@ A clean-room, high-performance server engine written in Rust that speaks the
 Minecraft network protocol, with a sandboxed WebAssembly mod runtime.
 
 > **Project status: Pre-Alpha / Architecture R&D.**
-> Pyrite answers the server list ping and completes login. There is no world,
-> no entities, and no mod runtime yet. You cannot play on it.
+> Pyrite answers the server list ping, completes login, and can read and write
+> NBT. There is no world, no entities, and no mod runtime yet. You cannot play
+> on it.
 
 **What this is NOT:** not Forge, Fabric, Paper, or Spigot. It cannot run
 existing Java `.jar` mods or plugins, and it never will — mods target a
@@ -17,14 +18,14 @@ WebAssembly interface instead. It ships no game assets.
 |---|---|---|
 | M1 | Protocol foundations, Server List Ping | **Done** |
 | M2 | Packet compression, Login state, offline identity | **Done** |
-| M3 | NBT | Not started |
+| M3 | NBT | **Done** |
 | M4 | Configuration + Play states — join an empty world | Not started |
 | M5 | Encryption (AES-128-CFB8), Mojang authentication | Not started |
 
 Targets protocol **776** (Java Edition 26.2), pinned in one place
 (`crates/protocol/src/version.rs`).
 
-105 tests. CI runs formatting, `clippy -D warnings`, the test suite on Linux,
+163 tests. CI runs formatting, `clippy -D warnings`, the test suite on Linux,
 macOS and Windows, and a licence audit of every dependency.
 
 ## Building and running
@@ -57,6 +58,7 @@ A Cargo workspace of decoupled crates:
 
 | Crate | Responsibility |
 |---|---|
+| `pyrite-nbt` | The NBT binary tree format: value types, codec, construction macros. Depends only on `bytes` and `thiserror` — it knows nothing about the network protocol, because NBT is also the format save files use, and the world storage that will read them should not have to depend on the wire. |
 | `pyrite-protocol` | Packet types, VarInt/VarLong, framing, compression. Executor-free, so it is usable from blocking code and from the future client. |
 | `pyrite-net` | Connection lifecycle, state machine, offline identity. Generic over the transport, so the same handler serves a socket, an in-memory pipe in tests, and later an in-process loopback server. |
 | `pyrite-server` | The binary: CLI, listener, bounded concurrency, graceful shutdown. |
@@ -64,6 +66,29 @@ A Cargo workspace of decoupled crates:
 Design decisions and their reasoning live in
 [`docs/superpowers/specs/`](docs/superpowers/specs/); each milestone has a
 design document recording what was decided and why.
+
+## Decoding hostile input
+
+Every byte the server parses is peer-controlled, and in offline mode any peer
+can reach the decoders. Four bounds exist because four separate defects of the
+same family were found — three by review, one only by measurement:
+
+- The frame decoder reserves in bounded steps, so a three-byte length claim
+  cannot commit megabytes.
+- Decompression rejects a declared inflated size above the frame maximum, and
+  reads one byte past the claim so a payload that inflates further is caught.
+- NBT caps nesting depth, because recursive descent on a few hundred kilobytes
+  of nested lists otherwise overflows the stack — and with `panic = "abort"`
+  that takes the process down, not one connection.
+- NBT caps total tags per document, and decodes compounds by appending rather
+  than by scanning for duplicates. The scan made decoding cost time quadratic
+  in an attacker-chosen count: roughly ninety seconds for one maximum-size
+  document.
+
+The last of those is the instructive one. It was invisible to every reviewer
+who read the code, because the offending function is four obviously-correct
+lines and is the *right* implementation for the builder API it was written for.
+Only measuring it against an adversarial document showed the shape.
 
 ## Clean-room
 
