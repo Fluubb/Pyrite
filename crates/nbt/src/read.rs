@@ -109,6 +109,13 @@ fn read_length<B: Buf>(src: &mut B, min_element_size: usize) -> Result<usize, Nb
 }
 
 /// Reads a compound's entries up to its terminating `End`.
+///
+/// `depth` counts wire nesting levels, not stack frames: it is passed
+/// unchanged to [`read_payload`] for each entry, which is the one place that
+/// increments it (once per compound or list level it recurses into). That
+/// keeps one semantic nesting level costing exactly one depth unit no matter
+/// whether it is a compound or a list, so `MAX_DEPTH` means the same thing
+/// for both shapes.
 fn read_compound_body<B: Buf>(src: &mut B, depth: usize) -> Result<NbtCompound, NbtError> {
     if depth > MAX_DEPTH {
         return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
@@ -121,12 +128,17 @@ fn read_compound_body<B: Buf>(src: &mut B, depth: usize) -> Result<NbtCompound, 
             return Ok(compound);
         }
         let name = read_nbt_string(src)?;
-        let value = read_payload(src, id, depth + 1)?;
+        let value = read_payload(src, id, depth)?;
         compound.insert(name, value);
     }
 }
 
 /// Reads one tag's payload, given its already-decoded type.
+///
+/// `depth` is the wire nesting level of `id` itself; recursing into a nested
+/// compound or list element increments it by exactly one, so one semantic
+/// nesting level costs one depth unit regardless of shape (see
+/// [`read_compound_body`]).
 fn read_payload<B: Buf>(src: &mut B, id: TagId, depth: usize) -> Result<NbtTag, NbtError> {
     if depth > MAX_DEPTH {
         return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
@@ -457,6 +469,24 @@ mod tests {
             read_network_root(&mut src),
             Err(NbtError::InvalidUtf8(_))
         ));
+    }
+
+    #[test]
+    fn a_document_may_be_followed_by_further_fields() {
+        // Milestone 4's packets carry nbt followed by other fields, so the
+        // reader must consume exactly one document and leave the rest for the
+        // next field's decoder. The "exactly one packet body" guarantee lives
+        // one layer up in RawPacket::decode_as, which is the only layer that
+        // can know whether a buffer holds one packet or a shared cursor.
+        let mut buf = BytesMut::new();
+        write_network_root(&mut buf, &sample()).unwrap();
+        buf.extend_from_slice(&[0xAB, 0xCD]);
+
+        let mut src = &buf[..];
+        let decoded = read_network_root(&mut src).unwrap();
+
+        assert_eq!(decoded, sample());
+        assert_eq!(src, &[0xAB, 0xCD], "following fields must survive intact");
     }
 
     #[test]
