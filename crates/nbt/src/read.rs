@@ -2,7 +2,7 @@
 
 use bytes::Buf;
 
-use crate::error::{MAX_DEPTH, NbtError};
+use crate::error::{MAX_DEPTH, MAX_TOTAL_NODES, NbtError};
 use crate::tag::{NbtCompound, NbtList, NbtTag, TagId};
 
 /// Caps how many elements are pre-allocated for an array or list.
@@ -21,7 +21,7 @@ pub fn read_network_root<B: Buf>(src: &mut B) -> Result<NbtCompound, NbtError> {
     if id != TagId::Compound {
         return Err(NbtError::RootNotCompound(id));
     }
-    read_compound_body(src, 1)
+    read_compound_body(src, 1, &mut 0)
 }
 
 /// Reads a document in the file form: a type byte, a name, then the payload.
@@ -31,7 +31,7 @@ pub fn read_named_root<B: Buf>(src: &mut B) -> Result<(String, NbtCompound), Nbt
         return Err(NbtError::RootNotCompound(id));
     }
     let name = read_nbt_string(src)?;
-    let compound = read_compound_body(src, 1)?;
+    let compound = read_compound_body(src, 1, &mut 0)?;
     Ok((name, compound))
 }
 
@@ -43,7 +43,7 @@ pub fn read_optional_network_root<B: Buf>(src: &mut B) -> Result<Option<NbtCompo
     let id = read_tag_id(src)?;
     match id {
         TagId::End => Ok(None),
-        TagId::Compound => Ok(Some(read_compound_body(src, 1)?)),
+        TagId::Compound => Ok(Some(read_compound_body(src, 1, &mut 0)?)),
         other => Err(NbtError::RootNotCompound(other)),
     }
 }
@@ -94,7 +94,9 @@ fn read_length<B: Buf>(src: &mut B, min_element_size: usize) -> Result<usize, Nb
     let required = len
         .checked_mul(min_element_size)
         .ok_or(NbtError::LengthExceedsInput {
-            declared: len,
+            // Saturating so this branch reports bytes like the one below,
+            // rather than a raw element count the message would misdescribe.
+            declared: len.saturating_mul(min_element_size),
             remaining: src.remaining(),
         })?;
 
@@ -112,11 +114,23 @@ fn read_length<B: Buf>(src: &mut B, min_element_size: usize) -> Result<usize, Nb
 ///
 /// `depth` counts wire nesting levels, not stack frames: it is passed
 /// unchanged to [`read_payload`] for each entry, which is the one place that
-/// increments it (once per compound or list level it recurses into). That
-/// keeps one semantic nesting level costing exactly one depth unit no matter
-/// whether it is a compound or a list, so `MAX_DEPTH` means the same thing
-/// for both shapes.
-fn read_compound_body<B: Buf>(src: &mut B, depth: usize) -> Result<NbtCompound, NbtError> {
+/// increments it. One nesting level therefore costs one depth unit for both
+/// compounds and lists, to within a single level -- a list sits at the same
+/// depth as its containing compound, so a chain of lists reaches one level
+/// deeper than a chain of compounds before the limit fires. Immaterial to
+/// stack safety; noted so the constant is not read as an exact promise.
+///
+/// `nodes` is the running total of tags decoded for this document, bounding
+/// the tree where `depth` bounds only its nesting.
+///
+/// This guard covers the recursion at the `TagId::Compound` arm of
+/// [`read_payload`]. It is not redundant with that function's own guard,
+/// which covers a path this one never sees: list elements.
+fn read_compound_body<B: Buf>(
+    src: &mut B,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<NbtCompound, NbtError> {
     if depth > MAX_DEPTH {
         return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
     }
@@ -128,20 +142,39 @@ fn read_compound_body<B: Buf>(src: &mut B, depth: usize) -> Result<NbtCompound, 
             return Ok(compound);
         }
         let name = read_nbt_string(src)?;
-        let value = read_payload(src, id, depth)?;
-        compound.insert(name, value);
+        let value = read_payload(src, id, depth, nodes)?;
+        // `push`, not `insert`: insert scans every existing entry to replace
+        // duplicates in place, which makes decoding an N-entry compound cost
+        // O(N^2) string comparisons. A peer controls N, so a single
+        // maximum-size document measured at roughly ninety seconds of blocked
+        // cpu before this changed.
+        compound.push(name, value);
     }
 }
 
 /// Reads one tag's payload, given its already-decoded type.
 ///
 /// `depth` is the wire nesting level of `id` itself; recursing into a nested
-/// compound or list element increments it by exactly one, so one semantic
-/// nesting level costs one depth unit regardless of shape (see
-/// [`read_compound_body`]).
-fn read_payload<B: Buf>(src: &mut B, id: TagId, depth: usize) -> Result<NbtTag, NbtError> {
+/// compound or list element increments it by one (see [`read_compound_body`]).
+///
+/// This guard covers entry from the list-element loop below, where no other
+/// check has run. It is not redundant with [`read_compound_body`]'s guard,
+/// which covers a path this one never sees: a compound's own recursion.
+fn read_payload<B: Buf>(
+    src: &mut B,
+    id: TagId,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<NbtTag, NbtError> {
     if depth > MAX_DEPTH {
         return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
+    }
+
+    *nodes += 1;
+    if *nodes > MAX_TOTAL_NODES {
+        return Err(NbtError::TooManyNodes {
+            max: MAX_TOTAL_NODES,
+        });
     }
 
     /// Reads a fixed-width value after checking the input holds it.
@@ -192,11 +225,11 @@ fn read_payload<B: Buf>(src: &mut B, id: TagId, depth: usize) -> Result<NbtTag, 
 
             let mut items = Vec::with_capacity(len.min(MAX_PREALLOC_ELEMENTS));
             for _ in 0..len {
-                items.push(read_payload(src, element_type, depth + 1)?);
+                items.push(read_payload(src, element_type, depth + 1, nodes)?);
             }
             NbtTag::List(NbtList::from_parts(element_type, items))
         }
-        TagId::Compound => NbtTag::Compound(read_compound_body(src, depth + 1)?),
+        TagId::Compound => NbtTag::Compound(read_compound_body(src, depth + 1, nodes)?),
         TagId::IntArray => {
             let len = read_length(src, 4)?;
             let mut values = Vec::with_capacity(len.min(MAX_PREALLOC_ELEMENTS));
@@ -402,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn an_array_longer_than_the_input_is_rejected_without_allocating() {
+    fn an_array_longer_than_the_input_is_rejected() {
         // Two billion ints declared inside a fifteen-byte document. The
         // containing frame is bounded elsewhere, but that bounds the frame,
         // not what the frame claims about itself.
@@ -421,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_list_longer_than_the_input_is_rejected_without_allocating() {
+    fn a_list_longer_than_the_input_is_rejected() {
         let mut buf = BytesMut::new();
         buf.put_u8(0x0a);
         buf.put_u8(0x09); // list
@@ -503,5 +536,91 @@ mod tests {
                 "a {cut}-byte prefix must not decode"
             );
         }
+    }
+
+    #[test]
+    fn a_large_flat_compound_decodes_in_linear_time() {
+        // Regression for a quadratic decode. NbtCompound::insert scans every
+        // existing entry to replace duplicates in place; calling it once per
+        // entry made decoding an N-entry compound cost O(N^2) string
+        // comparisons. A peer controls N, so a single maximum-size document
+        // measured at roughly ninety seconds of blocked cpu. The decoder now
+        // appends instead.
+        //
+        // The bound is deliberately generous: this catches a return to
+        // quadratic behaviour, it does not measure performance. The quadratic
+        // version took over two seconds for this input in release and far
+        // longer unoptimised.
+        const ENTRIES: usize = 40_000;
+
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        for i in 0..ENTRIES {
+            let name = format!("{i:04x}");
+            buf.put_u8(0x01);
+            buf.put_u16(name.len() as u16);
+            buf.put_slice(name.as_bytes());
+            buf.put_i8(1);
+        }
+        buf.put_u8(0x00);
+
+        let started = std::time::Instant::now();
+        let mut src = &buf[..];
+        let decoded = read_network_root(&mut src).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(decoded.len(), ENTRIES);
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "decoding {ENTRIES} entries took {elapsed:?}, which suggests the              quadratic path is back"
+        );
+    }
+
+    #[test]
+    fn a_document_exceeding_the_node_budget_is_rejected() {
+        // A list of empty compounds costs one wire byte per element but a
+        // whole NbtTag per element, so without a node budget a small document
+        // expands roughly fortyfold in memory.
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x09); // list
+        buf.put_u16(1);
+        buf.put_slice(b"l");
+        buf.put_u8(0x0a); // of compounds
+        buf.put_i32((MAX_TOTAL_NODES + 10) as i32);
+        for _ in 0..(MAX_TOTAL_NODES + 10) {
+            buf.put_u8(0x00); // each an immediately-terminated empty compound
+        }
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::TooManyNodes {
+                max: MAX_TOTAL_NODES
+            })
+        ));
+    }
+
+    #[test]
+    fn a_document_within_the_node_budget_still_decodes() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x09);
+        buf.put_u16(1);
+        buf.put_slice(b"l");
+        buf.put_u8(0x0a);
+        buf.put_i32(1_000);
+        for _ in 0..1_000 {
+            buf.put_u8(0x00);
+        }
+        buf.put_u8(0x00); // terminates the root compound
+
+        let mut src = &buf[..];
+        let decoded = read_network_root(&mut src).unwrap();
+        assert!(
+            matches!(decoded.get("l"), Some(NbtTag::List(list)) if list.len() == 1_000),
+            "expected a list of 1000 elements, got {:?}",
+            decoded.get("l").map(NbtTag::id)
+        );
     }
 }

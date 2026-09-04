@@ -39,6 +39,17 @@ fn write_nbt_string<B: BufMut>(dst: &mut B, value: &str) -> Result<(), NbtError>
     Ok(())
 }
 
+/// Converts a collection length to the `i32` the format uses.
+///
+/// A bare `as i32` would wrap a collection at or above `i32::MAX` into a
+/// negative length, which the decoder then rejects -- silent corruption on
+/// write, loud failure on read. Unreachable in practice, but strings already
+/// check their `u16` prefix two functions above, and an unchecked cast beside
+/// a checked one reads as though the difference was intended.
+fn array_len(len: usize) -> Result<i32, NbtError> {
+    i32::try_from(len).map_err(|_| NbtError::ArrayTooLong { len })
+}
+
 /// Writes a compound's entries followed by the terminating `End`.
 fn write_compound_body<B: BufMut>(dst: &mut B, value: &NbtCompound) -> Result<(), NbtError> {
     for (name, tag) in value.iter() {
@@ -60,7 +71,7 @@ fn write_payload<B: BufMut>(dst: &mut B, tag: &NbtTag) -> Result<(), NbtError> {
         NbtTag::Float(value) => dst.put_f32(*value),
         NbtTag::Double(value) => dst.put_f64(*value),
         NbtTag::ByteArray(value) => {
-            dst.put_i32(value.len() as i32);
+            dst.put_i32(array_len(value.len())?);
             dst.put_slice(value);
         }
         NbtTag::String(value) => write_nbt_string(dst, value)?,
@@ -68,20 +79,20 @@ fn write_payload<B: BufMut>(dst: &mut B, tag: &NbtTag) -> Result<(), NbtError> {
             // The element type is written once, and elements follow as bare
             // payloads with no per-element tag.
             dst.put_u8(list.element_type() as u8);
-            dst.put_i32(list.len() as i32);
+            dst.put_i32(array_len(list.len())?);
             for item in list.items() {
                 write_payload(dst, item)?;
             }
         }
         NbtTag::Compound(compound) => write_compound_body(dst, compound)?,
         NbtTag::IntArray(values) => {
-            dst.put_i32(values.len() as i32);
+            dst.put_i32(array_len(values.len())?);
             for value in values {
                 dst.put_i32(*value);
             }
         }
         NbtTag::LongArray(values) => {
-            dst.put_i32(values.len() as i32);
+            dst.put_i32(array_len(values.len())?);
             for value in values {
                 dst.put_i64(*value);
             }

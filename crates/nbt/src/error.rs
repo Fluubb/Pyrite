@@ -13,6 +13,18 @@ use crate::tag::TagId;
 /// the stack.
 pub const MAX_DEPTH: usize = 512;
 
+/// Maximum number of tags a single document may decode to.
+///
+/// Bounds the *tree*, where [`MAX_DEPTH`] bounds only its *nesting*. The two
+/// are independent: a flat document one level deep can still be enormous.
+///
+/// A list of empty compounds costs one wire byte per element but one `NbtTag`
+/// per element, so without this a maximum-size frame expands roughly fortyfold
+/// in memory -- and more than that transiently, while the backing vector
+/// reallocates. Real registry documents contain a few thousand tags, so this
+/// leaves about a hundredfold margin.
+pub const MAX_TOTAL_NODES: usize = 1 << 19;
+
 /// Every way NBT encoding or decoding can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum NbtError {
@@ -67,6 +79,20 @@ pub enum NbtError {
         expected: TagId,
         /// The type of the offending element.
         found: TagId,
+    },
+
+    /// The document decoded to more tags than [`MAX_TOTAL_NODES`] permits.
+    #[error("nbt document exceeded the maximum of {max} tags")]
+    TooManyNodes {
+        /// The node budget that was exhausted.
+        max: usize,
+    },
+
+    /// An array or list held more elements than its `i32` length can express.
+    #[error("nbt array of {len} elements exceeds the i32 length prefix")]
+    ArrayTooLong {
+        /// The collection's length.
+        len: usize,
     },
 
     /// A string exceeded the `u16` length prefix the format allows.

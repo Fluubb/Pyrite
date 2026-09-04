@@ -199,8 +199,14 @@ pub fn write_network_root<B: BufMut>(dst: &mut B, value: &NbtCompound);
 pub fn write_named_root<B: BufMut>(dst: &mut B, name: &str, value: &NbtCompound);
 ```
 
-Writing cannot fail: an `NbtTag` that exists is by construction encodable, and
-the list-homogeneity invariant is enforced at construction. No `Result`.
+**Amended after implementation.** This section originally said writing cannot
+fail and returns no `Result`. That premise was false: an NBT string is
+length-prefixed with a `u16`, so a `String` over 65,535 bytes is constructible
+but not encodable, and an array above `i32::MAX` elements likewise. Truncating
+would silently corrupt the document and panicking is forbidden on any path
+reachable from input, so both writers return `Result<(), NbtError>`. The
+list-homogeneity invariant *is* enforced at construction as originally
+described, so it needs no writer check.
 
 ### 4.4 `macros.rs`
 
@@ -248,6 +254,29 @@ is additionally capped at `MAX_PREALLOC_ELEMENTS` (64, matching the existing
 convention in `protocol/src/buf.rs`), so the vector grows with real data
 rather than with the claim.
 
+**Node budget — `MAX_TOTAL_NODES = 524_288`.** Added after the final review.
+Depth bounds a document's *nesting*; nothing bounded its *size*. A list of
+empty compounds costs one wire byte per element but a whole `NbtTag` per
+element, so a maximum-size frame expanded roughly fortyfold in memory, and
+more transiently while the backing vector reallocated. The budget is threaded
+through decoding exactly as `depth` is.
+
+**Compounds decode by appending, not by inserting.** Added after the final
+review. `NbtCompound::insert` scans existing entries to replace duplicates in
+place, which is right for hand-built documents and catastrophic in a decoder:
+calling it per entry made decoding an N-entry compound cost O(N²) string
+comparisons, measured at roughly ninety seconds of blocked CPU for one
+maximum-size document. The decoder uses an append-only path. NBT forbids
+duplicate names, so a document containing them is already malformed and
+keeping both rather than rejecting is a policy choice, not a correctness one.
+
+These two guards are a different shape from the rest of this section, and the
+difference is worth naming. Everything above bounds *allocation proportional
+to a declared length*. These bound *work and memory proportional to an
+undeclared, unbounded count* — which is why neither was anticipated here, and
+why the quadratic one was invisible to every reviewer who read the code rather
+than measuring it.
+
 **Negative lengths are rejected.** Array and list lengths are signed 32-bit, so
 a negative value is representable on the wire and must be a typed error rather
 than a cast into a huge `usize`.
@@ -271,9 +300,17 @@ pub enum NbtError {
     NegativeLength(i32),
     LengthExceedsInput { declared: usize, remaining: usize },
     InvalidListElementType(TagId),
+    HeterogeneousList { expected: TagId, found: TagId },
+    StringTooLong { len: usize },
+    ArrayTooLong { len: usize },
+    TooManyNodes { max: usize },
     InvalidUtf8(std::str::Utf8Error),
 }
 ```
+
+`HeterogeneousList` and `StringTooLong` arrived with the writer's `Result`
+return (§4.3); `ArrayTooLong` and `TooManyNodes` with the bounds added after
+the final review (§5).
 
 `NbtError` is the crate's own type. `pyrite-protocol` gains
 `ProtocolError::Nbt(#[from] NbtError)`, so a malformed document reaching the

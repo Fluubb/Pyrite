@@ -180,6 +180,21 @@ impl NbtCompound {
         }
     }
 
+    /// Appends an entry without checking for an existing key.
+    ///
+    /// The decoder uses this rather than [`NbtCompound::insert`], whose
+    /// replace-in-place scan makes decoding an N-entry compound cost O(N^2)
+    /// string comparisons. A peer controls N, so that is CPU proportional to
+    /// the square of an unbounded count -- roughly ninety seconds for a single
+    /// maximum-size document, measured.
+    ///
+    /// NBT forbids duplicate names, so a document containing them is already
+    /// malformed; appending both rather than rejecting is a policy choice, not
+    /// a correctness one, and it costs no scan.
+    pub fn push(&mut self, name: impl Into<String>, value: impl Into<NbtTag>) {
+        self.entries.push((name.into(), value.into()));
+    }
+
     /// Returns the tag with this name, if present.
     pub fn get(&self, name: &str) -> Option<&NbtTag> {
         self.entries
