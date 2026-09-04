@@ -168,6 +168,23 @@ where
     }
 }
 
+/// Writes an NBT document in the network root form.
+///
+/// Packets carry NBT in the network form, which omits the root compound's
+/// name. The file form belongs to save data and is not reachable from here.
+pub fn write_nbt<B: BufMut>(
+    dst: &mut B,
+    value: &pyrite_nbt::NbtCompound,
+) -> Result<(), ProtocolError> {
+    pyrite_nbt::write_network_root(dst, value)?;
+    Ok(())
+}
+
+/// Reads an NBT document in the network root form.
+pub fn read_nbt<B: Buf>(src: &mut B) -> Result<pyrite_nbt::NbtCompound, ProtocolError> {
+    Ok(pyrite_nbt::read_network_root(src)?)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -379,5 +396,34 @@ mod tests {
             read_prefixed_optional(&mut src, read_u16),
             Err(ProtocolError::InvalidBoolean(0x02))
         ));
+    }
+
+    #[test]
+    fn nbt_round_trips_through_the_buf_helpers() {
+        let mut document = pyrite_nbt::NbtCompound::new();
+        document.insert("id", 7i32);
+        document.insert("name", "minecraft:overworld");
+
+        let mut buf = BytesMut::new();
+        write_nbt(&mut buf, &document).unwrap();
+
+        let mut src = &buf[..];
+        assert_eq!(read_nbt(&mut src).unwrap(), document);
+        assert!(src.is_empty());
+    }
+
+    #[test]
+    fn nbt_uses_the_network_root_form() {
+        // No name between the compound tag and its body.
+        let mut buf = BytesMut::new();
+        write_nbt(&mut buf, &pyrite_nbt::NbtCompound::new()).unwrap();
+        assert_eq!(&buf[..], &[0x0a, 0x00]);
+    }
+
+    #[test]
+    fn a_malformed_document_surfaces_as_a_protocol_error() {
+        let buf: &[u8] = &[0x03, 0x00, 0x00, 0x00, 0x01];
+        let mut src = buf;
+        assert!(matches!(read_nbt(&mut src), Err(ProtocolError::Nbt(_))));
     }
 }

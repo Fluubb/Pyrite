@@ -127,6 +127,15 @@ pub enum ProtocolError {
         reason: String,
     },
 
+    /// An NBT document was malformed.
+    ///
+    /// Its own variant rather than folded into [`ProtocolError::Io`]: a
+    /// malformed document is a protocol violation by the peer and must be
+    /// logged as one. Filing it under a transport variant would classify it
+    /// as routine noise and hide it at the default log level.
+    #[error("nbt error: {0}")]
+    Nbt(#[from] pyrite_nbt::NbtError),
+
     /// A packet was compressed even though it is below the threshold at which
     /// compression is permitted.
     #[error("compressed packet of {data_length} bytes is below the {threshold} byte threshold")]

@@ -17,6 +17,7 @@ tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+pyrite-nbt.workspace = true
 
 [lints]
 workspace = true

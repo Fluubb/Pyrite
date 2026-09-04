@@ -343,6 +343,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyrite-nbt"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror",
+]
+
+[[package]]
 name = "pyrite-net"
 version = "0.1.0"
 dependencies = [
@@ -363,6 +371,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "flate2",
+ "pyrite-nbt",
  "serde",
  "serde_json",
  "thiserror",
