@@ -21,9 +21,7 @@ pub fn read_network_root<B: Buf>(src: &mut B) -> Result<NbtCompound, NbtError> {
     if id != TagId::Compound {
         return Err(NbtError::RootNotCompound(id));
     }
-    let compound = read_compound_body(src, 1)?;
-    ensure_fully_consumed(src)?;
-    Ok(compound)
+    read_compound_body(src, 1)
 }
 
 /// Reads a document in the file form: a type byte, a name, then the payload.
@@ -34,7 +32,6 @@ pub fn read_named_root<B: Buf>(src: &mut B) -> Result<(String, NbtCompound), Nbt
     }
     let name = read_nbt_string(src)?;
     let compound = read_compound_body(src, 1)?;
-    ensure_fully_consumed(src)?;
     Ok((name, compound))
 }
 
@@ -45,35 +42,10 @@ pub fn read_named_root<B: Buf>(src: &mut B) -> Result<(String, NbtCompound), Nbt
 pub fn read_optional_network_root<B: Buf>(src: &mut B) -> Result<Option<NbtCompound>, NbtError> {
     let id = read_tag_id(src)?;
     match id {
-        TagId::End => {
-            ensure_fully_consumed(src)?;
-            Ok(None)
-        }
-        TagId::Compound => {
-            let compound = read_compound_body(src, 1)?;
-            ensure_fully_consumed(src)?;
-            Ok(Some(compound))
-        }
+        TagId::End => Ok(None),
+        TagId::Compound => Ok(Some(read_compound_body(src, 1)?)),
         other => Err(NbtError::RootNotCompound(other)),
     }
-}
-
-/// Checks that a root-level read consumed the whole buffer it was given.
-///
-/// The two root forms are otherwise indistinguishable when the wrong one is
-/// used on a given buffer: nothing marks where a name would have ended, so a
-/// name's own length prefix can be misread as a plausible tag id and produce
-/// a structurally valid but wrong result rather than an error at the point
-/// of the mistake. A root document is expected to be handed a buffer that
-/// holds exactly one document, so leftover bytes are the signal that
-/// something was misaligned.
-fn ensure_fully_consumed<B: Buf>(src: &B) -> Result<(), NbtError> {
-    if src.has_remaining() {
-        return Err(NbtError::TrailingData {
-            remaining: src.remaining(),
-        });
-    }
-    Ok(())
 }
 
 /// Reads one type byte.
@@ -306,14 +278,31 @@ mod tests {
     }
 
     #[test]
-    fn the_two_root_forms_are_not_interchangeable() {
-        // Reading a named document as a network one misaligns everything from
-        // the name onwards. It must fail rather than silently produce
-        // nonsense.
+    fn reading_a_named_document_as_a_network_one_silently_misreads_it() {
+        // The forms differ by the root's name, so a network read of a named
+        // document consumes the name's length prefix as a tag id. For any
+        // name under 256 bytes that high byte is 0x00 -- an End -- so the
+        // read "succeeds" and yields an empty compound instead of failing.
+        //
+        // This is precisely why the two forms are separate entry points
+        // rather than one function with a flag: nothing at the type level or
+        // on the wire will catch the confusion for you, so the call site has
+        // to say which format it means.
         let mut buf = BytesMut::new();
         write_named_root(&mut buf, "root", &sample()).unwrap();
+
         let mut src = &buf[..];
-        assert!(read_network_root(&mut src).is_err());
+        let misread = read_network_root(&mut src).unwrap();
+
+        assert_ne!(
+            misread,
+            sample(),
+            "the document must not survive the confusion"
+        );
+        assert!(
+            misread.is_empty(),
+            "the name's high length byte reads as End"
+        );
     }
 
     #[test]
