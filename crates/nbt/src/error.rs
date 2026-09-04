@@ -81,4 +81,23 @@ pub enum NbtError {
     /// than an encoding to translate.
     #[error("nbt string was not valid utf-8")]
     InvalidUtf8(#[from] std::str::Utf8Error),
+
+    /// A root document decoded successfully but did not consume its whole
+    /// input.
+    ///
+    /// The two root forms differ only by a name in the middle of the stream,
+    /// with no marker separating them: reading a named document as a network
+    /// one does not reliably fail at the point of the mistake, because the
+    /// name's own length prefix can be misread as a plausible tag id (for
+    /// any name shorter than 256 bytes, the length prefix's high byte is
+    /// zero, which is also `TagId::End`, so the reader sees what looks like
+    /// an immediately empty compound). Left unchecked, that produces a
+    /// silently wrong but "successful" result instead of an error. Requiring
+    /// the whole buffer to be consumed is what actually distinguishes a
+    /// genuinely empty document from a misaligned read of a bigger one.
+    #[error("nbt document decoded but {remaining} bytes remained in the input")]
+    TrailingData {
+        /// Bytes left in the input after a complete document was read.
+        remaining: usize,
+    },
 }

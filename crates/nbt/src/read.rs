@@ -1,0 +1,488 @@
+//! Decoding NBT documents.
+
+use bytes::Buf;
+
+use crate::error::{MAX_DEPTH, NbtError};
+use crate::tag::{NbtCompound, NbtList, NbtTag, TagId};
+
+/// Caps how many elements are pre-allocated for an array or list.
+///
+/// The declared count is peer-controlled, so the vector grows with real data
+/// rather than with the claim. Matches the convention in
+/// `pyrite-protocol`'s `buf` module.
+const MAX_PREALLOC_ELEMENTS: usize = 64;
+
+/// Reads a document in the network form: a type byte, then the payload.
+///
+/// The root carries no name. Reading a file-form document with this will fail
+/// or produce nonsense, which is why the two forms are separate functions.
+pub fn read_network_root<B: Buf>(src: &mut B) -> Result<NbtCompound, NbtError> {
+    let id = read_tag_id(src)?;
+    if id != TagId::Compound {
+        return Err(NbtError::RootNotCompound(id));
+    }
+    let compound = read_compound_body(src, 1)?;
+    ensure_fully_consumed(src)?;
+    Ok(compound)
+}
+
+/// Reads a document in the file form: a type byte, a name, then the payload.
+pub fn read_named_root<B: Buf>(src: &mut B) -> Result<(String, NbtCompound), NbtError> {
+    let id = read_tag_id(src)?;
+    if id != TagId::Compound {
+        return Err(NbtError::RootNotCompound(id));
+    }
+    let name = read_nbt_string(src)?;
+    let compound = read_compound_body(src, 1)?;
+    ensure_fully_consumed(src)?;
+    Ok((name, compound))
+}
+
+/// Reads a network-form document that may be absent.
+///
+/// Some packets encode "no document here" as a lone `End` tag rather than as
+/// an empty compound, so a bare `0x00` yields `Ok(None)`.
+pub fn read_optional_network_root<B: Buf>(src: &mut B) -> Result<Option<NbtCompound>, NbtError> {
+    let id = read_tag_id(src)?;
+    match id {
+        TagId::End => {
+            ensure_fully_consumed(src)?;
+            Ok(None)
+        }
+        TagId::Compound => {
+            let compound = read_compound_body(src, 1)?;
+            ensure_fully_consumed(src)?;
+            Ok(Some(compound))
+        }
+        other => Err(NbtError::RootNotCompound(other)),
+    }
+}
+
+/// Checks that a root-level read consumed the whole buffer it was given.
+///
+/// The two root forms are otherwise indistinguishable when the wrong one is
+/// used on a given buffer: nothing marks where a name would have ended, so a
+/// name's own length prefix can be misread as a plausible tag id and produce
+/// a structurally valid but wrong result rather than an error at the point
+/// of the mistake. A root document is expected to be handed a buffer that
+/// holds exactly one document, so leftover bytes are the signal that
+/// something was misaligned.
+fn ensure_fully_consumed<B: Buf>(src: &B) -> Result<(), NbtError> {
+    if src.has_remaining() {
+        return Err(NbtError::TrailingData {
+            remaining: src.remaining(),
+        });
+    }
+    Ok(())
+}
+
+/// Reads one type byte.
+fn read_tag_id<B: Buf>(src: &mut B) -> Result<TagId, NbtError> {
+    if !src.has_remaining() {
+        return Err(NbtError::UnexpectedEof);
+    }
+    TagId::try_from(src.get_u8())
+}
+
+/// Reads a length-prefixed UTF-8 string.
+///
+/// The prefix is unsigned 16-bit, so it cannot exceed the input by more than
+/// 64 KiB, but the remaining-bytes check still runs before allocating.
+fn read_nbt_string<B: Buf>(src: &mut B) -> Result<String, NbtError> {
+    if src.remaining() < 2 {
+        return Err(NbtError::UnexpectedEof);
+    }
+    let len = usize::from(src.get_u16());
+
+    if src.remaining() < len {
+        return Err(NbtError::LengthExceedsInput {
+            declared: len,
+            remaining: src.remaining(),
+        });
+    }
+
+    let mut bytes = vec![0u8; len];
+    src.copy_to_slice(&mut bytes);
+    String::from_utf8(bytes).map_err(|error| NbtError::InvalidUtf8(error.utf8_error()))
+}
+
+/// Reads a signed 32-bit element count and checks it against the input.
+///
+/// `min_element_size` is the smallest number of bytes one element can occupy.
+/// For fixed-width elements that is exact; for compounds and lists it is a
+/// lower bound, which is all that is needed to reject a count that could not
+/// possibly fit.
+fn read_length<B: Buf>(src: &mut B, min_element_size: usize) -> Result<usize, NbtError> {
+    if src.remaining() < 4 {
+        return Err(NbtError::UnexpectedEof);
+    }
+    let declared = src.get_i32();
+    let len = usize::try_from(declared).map_err(|_| NbtError::NegativeLength(declared))?;
+
+    let required = len
+        .checked_mul(min_element_size)
+        .ok_or(NbtError::LengthExceedsInput {
+            declared: len,
+            remaining: src.remaining(),
+        })?;
+
+    if required > src.remaining() {
+        return Err(NbtError::LengthExceedsInput {
+            declared: required,
+            remaining: src.remaining(),
+        });
+    }
+
+    Ok(len)
+}
+
+/// Reads a compound's entries up to its terminating `End`.
+fn read_compound_body<B: Buf>(src: &mut B, depth: usize) -> Result<NbtCompound, NbtError> {
+    if depth > MAX_DEPTH {
+        return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
+    }
+
+    let mut compound = NbtCompound::new();
+    loop {
+        let id = read_tag_id(src)?;
+        if id == TagId::End {
+            return Ok(compound);
+        }
+        let name = read_nbt_string(src)?;
+        let value = read_payload(src, id, depth + 1)?;
+        compound.insert(name, value);
+    }
+}
+
+/// Reads one tag's payload, given its already-decoded type.
+fn read_payload<B: Buf>(src: &mut B, id: TagId, depth: usize) -> Result<NbtTag, NbtError> {
+    if depth > MAX_DEPTH {
+        return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
+    }
+
+    /// Reads a fixed-width value after checking the input holds it.
+    macro_rules! fixed {
+        ($size:expr, $get:ident, $variant:ident) => {{
+            if src.remaining() < $size {
+                return Err(NbtError::UnexpectedEof);
+            }
+            NbtTag::$variant(src.$get())
+        }};
+    }
+
+    Ok(match id {
+        // `End` never reaches here: compound bodies handle it as a terminator
+        // and a list declaring it is rejected before elements are read.
+        TagId::End => return Err(NbtError::InvalidListElementType(TagId::End)),
+        TagId::Byte => fixed!(1, get_i8, Byte),
+        TagId::Short => fixed!(2, get_i16, Short),
+        TagId::Int => fixed!(4, get_i32, Int),
+        TagId::Long => fixed!(8, get_i64, Long),
+        TagId::Float => fixed!(4, get_f32, Float),
+        TagId::Double => fixed!(8, get_f64, Double),
+        TagId::ByteArray => {
+            let len = read_length(src, 1)?;
+            NbtTag::ByteArray(src.copy_to_bytes(len))
+        }
+        TagId::String => NbtTag::String(read_nbt_string(src)?),
+        TagId::List => {
+            let element_type = read_tag_id(src)?;
+
+            // A list of End may only be empty; the element size below assumes
+            // a real type, and a non-empty list of End is malformed anyway.
+            let min_element_size = match element_type {
+                TagId::End => 0,
+                TagId::Byte => 1,
+                TagId::Short => 2,
+                TagId::Int | TagId::Float => 4,
+                TagId::Long | TagId::Double => 8,
+                // Variable-width: one byte is the smallest an element can be
+                // (an empty compound is its lone End terminator).
+                _ => 1,
+            };
+
+            let len = read_length(src, min_element_size)?;
+            if element_type == TagId::End && len != 0 {
+                return Err(NbtError::InvalidListElementType(TagId::End));
+            }
+
+            let mut items = Vec::with_capacity(len.min(MAX_PREALLOC_ELEMENTS));
+            for _ in 0..len {
+                items.push(read_payload(src, element_type, depth + 1)?);
+            }
+            NbtTag::List(NbtList::from_parts(element_type, items))
+        }
+        TagId::Compound => NbtTag::Compound(read_compound_body(src, depth + 1)?),
+        TagId::IntArray => {
+            let len = read_length(src, 4)?;
+            let mut values = Vec::with_capacity(len.min(MAX_PREALLOC_ELEMENTS));
+            for _ in 0..len {
+                values.push(src.get_i32());
+            }
+            NbtTag::IntArray(values)
+        }
+        TagId::LongArray => {
+            let len = read_length(src, 8)?;
+            let mut values = Vec::with_capacity(len.min(MAX_PREALLOC_ELEMENTS));
+            for _ in 0..len {
+                values.push(src.get_i64());
+            }
+            NbtTag::LongArray(values)
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::tag::{NbtCompound, NbtList, NbtTag};
+    use crate::write::{write_named_root, write_network_root};
+    use bytes::{BufMut, Bytes, BytesMut};
+
+    /// A document exercising every tag type.
+    fn sample() -> NbtCompound {
+        let mut inner = NbtCompound::new();
+        inner.insert("nested", 1i8);
+
+        let mut root = NbtCompound::new();
+        root.insert("byte", 1i8);
+        root.insert("short", -2i16);
+        root.insert("int", 3i32);
+        root.insert("long", -4i64);
+        root.insert("float", 1.5f32);
+        root.insert("double", -2.5f64);
+        root.insert("bytes", Bytes::from_static(&[1, 2, 3]));
+        root.insert("string", "hello");
+        root.insert(
+            "list",
+            NbtList::new(vec![NbtTag::Int(1), NbtTag::Int(2)]).unwrap(),
+        );
+        root.insert("empty_list", NbtList::empty());
+        root.insert("compound", inner);
+        root.insert("ints", vec![1i32, -1]);
+        root.insert("longs", vec![1i64, -1]);
+        root
+    }
+
+    #[test]
+    fn every_tag_type_round_trips_as_a_value() {
+        let original = sample();
+        let mut buf = BytesMut::new();
+        write_network_root(&mut buf, &original).unwrap();
+
+        let mut src = &buf[..];
+        let decoded = read_network_root(&mut src).unwrap();
+
+        assert_eq!(decoded, original);
+        assert!(src.is_empty(), "the whole document must be consumed");
+    }
+
+    #[test]
+    fn every_tag_type_round_trips_as_bytes() {
+        // The value round trip alone cannot catch an encoder and decoder that
+        // are wrong in the same way; re-encoding and comparing bytes can.
+        let mut buf = BytesMut::new();
+        write_network_root(&mut buf, &sample()).unwrap();
+
+        let mut src = &buf[..];
+        let decoded = read_network_root(&mut src).unwrap();
+
+        let mut reencoded = BytesMut::new();
+        write_network_root(&mut reencoded, &decoded).unwrap();
+        assert_eq!(reencoded, buf);
+    }
+
+    #[test]
+    fn a_named_root_round_trips_with_its_name() {
+        let mut buf = BytesMut::new();
+        write_named_root(&mut buf, "root", &sample()).unwrap();
+
+        let mut src = &buf[..];
+        let (name, decoded) = read_named_root(&mut src).unwrap();
+        assert_eq!(name, "root");
+        assert_eq!(decoded, sample());
+    }
+
+    #[test]
+    fn the_two_root_forms_are_not_interchangeable() {
+        // Reading a named document as a network one misaligns everything from
+        // the name onwards. It must fail rather than silently produce
+        // nonsense.
+        let mut buf = BytesMut::new();
+        write_named_root(&mut buf, "root", &sample()).unwrap();
+        let mut src = &buf[..];
+        assert!(read_network_root(&mut src).is_err());
+    }
+
+    #[test]
+    fn an_empty_compound_round_trips() {
+        let mut buf = BytesMut::new();
+        write_network_root(&mut buf, &NbtCompound::new()).unwrap();
+        let mut src = &buf[..];
+        assert_eq!(read_network_root(&mut src).unwrap(), NbtCompound::new());
+    }
+
+    #[test]
+    fn an_absent_optional_document_is_none() {
+        // Some packets encode "no nbt here" as a lone End tag rather than an
+        // empty compound.
+        let buf: &[u8] = &[0x00];
+        let mut src = buf;
+        assert_eq!(read_optional_network_root(&mut src).unwrap(), None);
+    }
+
+    #[test]
+    fn a_present_optional_document_is_some() {
+        let mut buf = BytesMut::new();
+        write_network_root(&mut buf, &sample()).unwrap();
+        let mut src = &buf[..];
+        assert_eq!(
+            read_optional_network_root(&mut src).unwrap(),
+            Some(sample())
+        );
+    }
+
+    #[test]
+    fn a_non_compound_root_is_rejected() {
+        let buf: &[u8] = &[0x03, 0x00, 0x00, 0x00, 0x01];
+        let mut src = buf;
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::RootNotCompound(TagId::Int))
+        ));
+    }
+
+    #[test]
+    fn an_unknown_tag_id_is_rejected() {
+        // Root compound, then a field with type byte 0x7f.
+        let buf: &[u8] = &[0x0a, 0x7f, 0x00, 0x01, b'x'];
+        let mut src = buf;
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::UnknownTag(0x7f))
+        ));
+    }
+
+    #[test]
+    fn nesting_beyond_the_depth_limit_is_rejected() {
+        // Compounds nested past MAX_DEPTH. Without a limit this recurses
+        // until the stack overflows, which with panic = "abort" takes the
+        // whole process down rather than one connection.
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a); // root
+        for _ in 0..(MAX_DEPTH + 10) {
+            buf.put_u8(0x0a); // nested compound
+            buf.put_u16(0); // empty name
+        }
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::DepthExceeded { max: MAX_DEPTH })
+        ));
+    }
+
+    #[test]
+    fn a_negative_array_length_is_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a); // root
+        buf.put_u8(0x0b); // int array
+        buf.put_u16(1);
+        buf.put_slice(b"a");
+        buf.put_i32(-1);
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::NegativeLength(-1))
+        ));
+    }
+
+    #[test]
+    fn an_array_longer_than_the_input_is_rejected_without_allocating() {
+        // Two billion ints declared inside a fifteen-byte document. The
+        // containing frame is bounded elsewhere, but that bounds the frame,
+        // not what the frame claims about itself.
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x0b); // int array
+        buf.put_u16(1);
+        buf.put_slice(b"a");
+        buf.put_i32(2_000_000_000);
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::LengthExceedsInput { .. })
+        ));
+    }
+
+    #[test]
+    fn a_list_longer_than_the_input_is_rejected_without_allocating() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x09); // list
+        buf.put_u16(1);
+        buf.put_slice(b"a");
+        buf.put_u8(0x0a); // of compounds
+        buf.put_i32(2_000_000_000);
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::LengthExceedsInput { .. })
+        ));
+    }
+
+    #[test]
+    fn a_non_empty_list_of_end_is_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x09);
+        buf.put_u16(1);
+        buf.put_slice(b"a");
+        buf.put_u8(0x00); // element type End
+        buf.put_i32(3); // but three elements
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::InvalidListElementType(TagId::End))
+        ));
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_string_is_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x0a);
+        buf.put_u8(0x08); // string
+        buf.put_u16(1);
+        buf.put_slice(b"a");
+        buf.put_u16(2);
+        buf.put_slice(&[0xff, 0xfe]);
+
+        let mut src = &buf[..];
+        assert!(matches!(
+            read_network_root(&mut src),
+            Err(NbtError::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn truncation_at_any_point_is_rejected() {
+        let mut buf = BytesMut::new();
+        write_network_root(&mut buf, &sample()).unwrap();
+
+        // Every proper prefix is incomplete and must error rather than
+        // producing a partial document.
+        for cut in 1..buf.len() {
+            let mut src = &buf[..cut];
+            assert!(
+                read_network_root(&mut src).is_err(),
+                "a {cut}-byte prefix must not decode"
+            );
+        }
+    }
+}

@@ -12,9 +12,11 @@
 //! separate functions rather than a flag.
 
 pub mod error;
+pub mod read;
 pub mod tag;
 pub mod write;
 
 pub use error::{MAX_DEPTH, NbtError};
+pub use read::{read_named_root, read_network_root, read_optional_network_root};
 pub use tag::{NbtCompound, NbtList, NbtTag, TagId};
 pub use write::{write_named_root, write_network_root};

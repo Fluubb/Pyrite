@@ -254,7 +254,6 @@ impl NbtList {
     /// Used by the decoder, which reads a declared element type and then
     /// reads exactly that many values of exactly that type, so the invariant
     /// holds structurally.
-    #[allow(dead_code)]
     pub(crate) fn from_parts(element_type: TagId, items: Vec<NbtTag>) -> Self {
         Self {
             element_type,
