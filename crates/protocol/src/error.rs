@@ -105,6 +105,25 @@ pub enum ProtocolError {
     #[error("invalid boolean byte {0:#04x}, expected 0 or 1")]
     InvalidBoolean(u8),
 
+    /// A compressed packet inflated to a different size than it declared.
+    #[error("compressed packet declared {declared} bytes but inflated to {actual}")]
+    CompressedSizeMismatch {
+        /// The size the peer said the payload would inflate to.
+        declared: usize,
+        /// The size it actually inflated to.
+        actual: usize,
+    },
+
+    /// A packet was compressed even though it is below the threshold at which
+    /// compression is permitted.
+    #[error("compressed packet of {data_length} bytes is below the {threshold} byte threshold")]
+    CompressedBelowThreshold {
+        /// The declared uncompressed size.
+        data_length: usize,
+        /// The active compression threshold.
+        threshold: i32,
+    },
+
     /// A string field did not contain valid UTF-8.
     #[error("string field was not valid utf-8")]
     InvalidUtf8(#[from] std::str::Utf8Error),
