@@ -2,7 +2,7 @@
 
 use bytes::BufMut;
 
-use crate::error::NbtError;
+use crate::error::{MAX_DEPTH, NbtError};
 use crate::tag::{NbtCompound, NbtTag, TagId};
 
 /// Writes a document in the network form: a type byte, then the payload.
@@ -11,7 +11,7 @@ use crate::tag::{NbtCompound, NbtTag, TagId};
 /// 764; use [`write_named_root`] for save files.
 pub fn write_network_root<B: BufMut>(dst: &mut B, value: &NbtCompound) -> Result<(), NbtError> {
     dst.put_u8(TagId::Compound as u8);
-    write_compound_body(dst, value)
+    write_compound_body(dst, value, 1)
 }
 
 /// Writes a document in the file form: a type byte, a name, then the payload.
@@ -22,7 +22,7 @@ pub fn write_named_root<B: BufMut>(
 ) -> Result<(), NbtError> {
     dst.put_u8(TagId::Compound as u8);
     write_nbt_string(dst, name)?;
-    write_compound_body(dst, value)
+    write_compound_body(dst, value, 1)
 }
 
 /// Writes a length-prefixed UTF-8 string.
@@ -51,18 +51,45 @@ fn array_len(len: usize) -> Result<i32, NbtError> {
 }
 
 /// Writes a compound's entries followed by the terminating `End`.
-fn write_compound_body<B: BufMut>(dst: &mut B, value: &NbtCompound) -> Result<(), NbtError> {
+///
+/// `depth` mirrors the reader's: it counts wire nesting levels, not stack
+/// frames, and this function's own guard covers the recursion at the
+/// [`NbtTag::Compound`] arm of [`write_payload`] -- the same split the reader
+/// uses between `read_compound_body` and `read_payload`, for the same reason.
+/// Without it, a hand-built tree deeper than [`MAX_DEPTH`] -- Milestone 4's
+/// registry generation is exactly the kind of code that could build one --
+/// would overflow the stack on write, which aborts the whole process under
+/// `panic = "abort"` rather than failing the one call that built it.
+fn write_compound_body<B: BufMut>(
+    dst: &mut B,
+    value: &NbtCompound,
+    depth: usize,
+) -> Result<(), NbtError> {
+    if depth > MAX_DEPTH {
+        return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
+    }
+
     for (name, tag) in value.iter() {
         dst.put_u8(tag.id() as u8);
         write_nbt_string(dst, name)?;
-        write_payload(dst, tag)?;
+        write_payload(dst, tag, depth)?;
     }
     dst.put_u8(TagId::End as u8);
     Ok(())
 }
 
 /// Writes a tag's payload, without its type byte or name.
-fn write_payload<B: BufMut>(dst: &mut B, tag: &NbtTag) -> Result<(), NbtError> {
+///
+/// `depth` is the wire nesting level of `tag` itself; recursing into a list
+/// element or a nested compound increments it by one, matching
+/// [`write_compound_body`]'s guard on the same value. This function's own
+/// guard covers entry from the list-element loop below, the one recursion
+/// path that never passes through `write_compound_body` first.
+fn write_payload<B: BufMut>(dst: &mut B, tag: &NbtTag, depth: usize) -> Result<(), NbtError> {
+    if depth > MAX_DEPTH {
+        return Err(NbtError::DepthExceeded { max: MAX_DEPTH });
+    }
+
     match tag {
         NbtTag::Byte(value) => dst.put_i8(*value),
         NbtTag::Short(value) => dst.put_i16(*value),
@@ -81,10 +108,10 @@ fn write_payload<B: BufMut>(dst: &mut B, tag: &NbtTag) -> Result<(), NbtError> {
             dst.put_u8(list.element_type() as u8);
             dst.put_i32(array_len(list.len())?);
             for item in list.items() {
-                write_payload(dst, item)?;
+                write_payload(dst, item, depth + 1)?;
             }
         }
-        NbtTag::Compound(compound) => write_compound_body(dst, compound)?,
+        NbtTag::Compound(compound) => write_compound_body(dst, compound, depth + 1)?,
         NbtTag::IntArray(values) => {
             dst.put_i32(array_len(values.len())?);
             for value in values {
@@ -259,5 +286,45 @@ mod tests {
             write_network_root(&mut buf, &root),
             Err(NbtError::StringTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn writing_beyond_the_depth_limit_is_rejected() {
+        // The writer has no recursion-depth check of its own until this
+        // guard: nothing stopped a hand-built tree deeper than MAX_DEPTH from
+        // overflowing the stack on write, which aborts the whole process
+        // rather than failing the one call that built the tree. Milestone
+        // 4's registry generation is exactly the kind of code that
+        // constructs deep, machine-built trees, so this is not a purely
+        // theoretical caller.
+        let mut root = NbtCompound::new();
+        root.insert("leaf", 1i8);
+        for _ in 0..(MAX_DEPTH + 10) {
+            let mut wrapper = NbtCompound::new();
+            wrapper.insert("x", root);
+            root = wrapper;
+        }
+
+        let mut buf = BytesMut::new();
+        assert!(matches!(
+            write_network_root(&mut buf, &root),
+            Err(NbtError::DepthExceeded { max: MAX_DEPTH })
+        ));
+    }
+
+    #[test]
+    fn writing_within_the_depth_limit_succeeds() {
+        // Boundary companion to the test above: the guard must not fire
+        // early and reject well-formed, merely deep documents.
+        let mut root = NbtCompound::new();
+        root.insert("leaf", 1i8);
+        for _ in 0..(MAX_DEPTH - 2) {
+            let mut wrapper = NbtCompound::new();
+            wrapper.insert("x", root);
+            root = wrapper;
+        }
+
+        let mut buf = BytesMut::new();
+        assert!(write_network_root(&mut buf, &root).is_ok());
     }
 }
